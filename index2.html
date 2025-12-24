@@ -1,0 +1,860 @@
+﻿<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>연금 ETF 포트폴리오 최적화 (Demo)</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --muted: #6c757d;
+    }
+    body { background: var(--bg); }
+    .app-shell { max-width: 1280px; }
+    .hero {
+      background: linear-gradient(135deg, #0d6efd 0%, #0dcaf0 100%);
+      color: #fff;
+      border-radius: 18px;
+      padding: 22px 22px;
+    }
+    .hero h1 { font-weight: 800; letter-spacing: -0.02em; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 800;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.18);
+      border: 1px solid rgba(255,255,255,0.28);
+      color: #fff;
+      backdrop-filter: blur(6px);
+    }
+    .card { border: 0; border-radius: 16px; box-shadow: 0 10px 30px rgba(16,24,40,0.06); }
+    .card-header { background: transparent; border-bottom: 1px solid rgba(0,0,0,0.06); }
+    .plot-wrap { height: 560px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; }
+    .small-muted { color: var(--muted); font-size: 12px; }
+    .btn-soft { background: rgba(13,110,253,0.10); border: 1px solid rgba(13,110,253,0.18); color: #0d6efd; font-weight: 800; }
+    .btn-soft:hover { background: rgba(13,110,253,0.16); border-color: rgba(13,110,253,0.24); }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 800;
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(0,0,0,0.08);
+      background: #fff;
+      color: #212529;
+    }
+    .tag-demo { border-color: rgba(255,193,7,0.45); background: rgba(255,193,7,0.12); color: #7a5a00; }
+    .risk-chip { font-weight: 900; }
+    .progress { height: 10px; border-radius: 999px; }
+    .progress-bar { border-radius: 999px; }
+    .sticky-controls {
+      position: sticky;
+      bottom: 16px;
+      z-index: 30;
+    }
+    @media (max-width: 992px) {
+      .plot-wrap { height: 460px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container app-shell py-4">
+    <div class="hero mb-3">
+      <div class="d-flex flex-column flex-md-row gap-3 align-items-start align-items-md-center justify-content-between">
+        <div>
+          <h1 class="h3 mb-1">연금 ETF 포트폴리오 최적화</h1>
+          <div class="small" style="opacity:0.92;">국내 연금투자 가능 ETF 기반 분석 결과 시각화 (PRD v1.0 데모 화면)</div>
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+          <span class="pill">마지막 업데이트: <span class="mono" id="lastUpdated">-</span></span>
+          <span class="pill">동시접속 목표: 100</span>
+        </div>
+      </div>
+
+      <div class="mt-3">
+        <div class="alert alert-warning mb-0" role="alert" style="border-radius: 14px;">
+          <strong>법적 고지</strong>: 본 서비스는 <strong>투자 참고 정보 제공 목적</strong>이며 <strong>투자 권유가 아닙니다</strong>. 투자 손실의 책임은 사용자 본인에게 있습니다.
+          <div class="small-muted mt-1">현재 화면의 수치/포트폴리오는 <span class="fw-bold">DEMO(샘플 데이터)</span>이며, 실제 데이터/백엔드 연결 시 교체됩니다.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row g-3">
+      <div class="col-lg-8">
+        <div class="card">
+          <div class="card-header d-flex flex-wrap gap-2 align-items-center justify-content-between">
+            <div>
+              <div class="fw-bold">변동성(x) – 수익률(y) (Mean–Variance)</div>
+              <div class="small-muted">회색: 랜덤 포트폴리오(200) · 파랑 별: 최적 포트폴리오 · 파랑 선: 효율적 프론티어 · 점 클릭 시 상세보기</div>
+            </div>
+            <div class="d-flex gap-2 align-items-center">
+              <span class="tag tag-demo">DEMO</span>
+              <button class="btn btn-soft btn-sm" id="btnResetSelection" type="button">선택 해제</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div id="plot" class="plot-wrap"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-lg-4">
+        <div class="card h-100">
+          <div class="card-header d-flex align-items-center justify-content-between">
+            <div class="fw-bold">포트폴리오 상세</div>
+            <span class="tag tag-demo">DEMO</span>
+          </div>
+          <div class="card-body" id="sidebar">
+            <div class="text-center py-4" id="sidebarEmpty">
+              <div class="fw-bold mb-2">차트에서 점을 클릭해보세요</div>
+              <div class="small-muted">선택한 포트폴리오의 종목 비중/지표/대체 종목 정보를 표시합니다.</div>
+              <hr class="my-4" />
+              <div class="small-muted">팁: 아래에서 기간(Period 1/2/Forecast)을 바꾼 뒤 <strong>분석 실행</strong>을 누르면 차트가 갱신됩니다.</div>
+            </div>
+
+            <div id="sidebarContent" class="d-none">
+              <div class="d-flex align-items-start justify-content-between gap-2">
+                <div>
+                  <div class="fw-bold" id="portfolioTitle">-</div>
+                  <div class="small-muted" id="portfolioSubtitle">-</div>
+                </div>
+                <div class="text-end">
+                  <div class="risk-chip" id="riskChip">-</div>
+                  <div class="small-muted">위험 구간(월 변동성)</div>
+                </div>
+              </div>
+
+              <hr class="my-3" />
+
+              <div class="row g-2">
+                <div class="col-4">
+                  <div class="small-muted">수익률</div>
+                  <div class="fw-bold" id="metricReturn">-</div>
+                </div>
+                <div class="col-4">
+                  <div class="small-muted">변동성</div>
+                  <div class="fw-bold" id="metricVol">-</div>
+                </div>
+                <div class="col-4">
+                  <div class="small-muted">샤프</div>
+                  <div class="fw-bold" id="metricSharpe">-</div>
+                </div>
+              </div>
+
+              <div class="mt-3">
+                <div class="d-flex align-items-center justify-content-between">
+                  <div class="fw-bold">구성 종목</div>
+                  <div class="small-muted">(비중 합 100%)</div>
+                </div>
+
+                <div class="mt-2" id="holdingsList"></div>
+              </div>
+
+              <div class="mt-3">
+                <div class="fw-bold">해설(요약)</div>
+                <div class="small-muted" id="explainText">-</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mt-3">
+          <div class="card-header d-flex align-items-center justify-content-between">
+            <div class="fw-bold">🎯 추천 포트폴리오</div>
+            <span class="tag tag-demo">DEMO</span>
+          </div>
+          <div class="card-body">
+            <div class="d-grid gap-2" id="recommendCards"></div>
+            <div class="small-muted mt-2">* ‘추천’은 PRD 표현을 그대로 사용하되, 투자 권유가 아닌 <strong>과거 데이터 기반 분석 결과의 대표 포인트</strong>로만 표시합니다.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sticky-controls mt-3">
+      <div class="card">
+        <div class="card-body d-flex flex-column flex-md-row align-items-start align-items-md-center justify-content-between gap-3">
+          <div>
+            <div class="fw-bold mb-2">기간 선택</div>
+            <div class="btn-group" role="group" aria-label="기간 선택">
+              <input type="radio" class="btn-check" name="period" id="p1" autocomplete="off" value="p1" checked>
+              <label class="btn btn-outline-primary" for="p1">Period 1</label>
+
+              <input type="radio" class="btn-check" name="period" id="p2" autocomplete="off" value="p2">
+              <label class="btn btn-outline-primary" for="p2">Period 2</label>
+
+              <input type="radio" class="btn-check" name="period" id="fc" autocomplete="off" value="fc">
+              <label class="btn btn-outline-primary" for="fc">Forecast</label>
+            </div>
+            <div class="small-muted mt-2">Period 1: 12개월 전~6개월 전 · Period 2: 최근 6개월 · Forecast: 향후 6개월(데모)</div>
+          </div>
+
+          <div class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary fw-bold" id="btnRun" type="button">분석 실행</button>
+            <button class="btn btn-outline-secondary fw-bold" id="btnRandomize" type="button">샘플 재생성</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Substitute Modal -->
+  <div class="modal fade" id="subModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+      <div class="modal-content" style="border-radius: 16px;">
+        <div class="modal-header">
+          <h5 class="modal-title">대체 가능 종목 (DEMO)</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <div class="small-muted mb-2">상관계수 R > 0.95 기준으로 같은 클러스터로 묶인 종목 예시입니다(데모).</div>
+          <div class="table-responsive">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr>
+                  <th>대표 종목</th>
+                  <th>대체 종목</th>
+                  <th class="text-end">상관계수</th>
+                </tr>
+              </thead>
+              <tbody id="subTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary fw-bold" data-bs-dismiss="modal">닫기</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    const CONFIG = {
+      meta: {
+        riskFreeRateAnnual: 0.03,
+        randomPortfoliosCount: 200,
+        maxAssetsInRandom: 10,
+        targetMonthlyVol: 0.02,
+      },
+      copy: {
+        periodNames: {
+          p1: 'Period 1 (과거: 12개월 전~6개월 전)',
+          p2: 'Period 2 (현재: 최근 6개월)',
+          fc: 'Forecast (예측: 향후 6개월 · DEMO)',
+        },
+        portfolioKinds: {
+          random: '랜덤 포트폴리오',
+          optimal_sharpe: '🎯 기본 추천 (Sharpe 최대)',
+          optimal_target_vol: '🎚 연금 투자 (월 2% 변동성 목표)',
+          efficient_frontier: '효율적 프론티어',
+        },
+      },
+      colors: {
+        random: 'rgba(108,117,125,0.25)',
+        frontier: '#0d6efd',
+        optimal: '#0d6efd',
+        selected: '#111827',
+      },
+      riskBandsMonthly: [
+        { name: '초보수', max: 0.010, color: '#2E7D32' },
+        { name: '보수',   max: 0.015, color: '#66BB6A' },
+        { name: '중립',   max: 0.020, color: '#FDD835' },
+        { name: '적극',   max: 0.030, color: '#FFA726' },
+        { name: '공격',   max: 0.050, color: '#FF7043' },
+        { name: '초공격', max: 0.100, color: '#E53935' },
+        { name: '위험',   max: Infinity, color: '#B71C1C' },
+      ],
+      etfUniverse: [
+        { code: '069500', name: 'KODEX 200' },
+        { code: '379800', name: 'KODEX 미국S&P500TR' },
+        { code: '133690', name: 'TIGER 미국나스닥100' },
+        { code: '148070', name: 'KOSEF 국고채10년' },
+        { code: '305080', name: 'TIGER 미국채10년선물' },
+        { code: '182490', name: 'TIGER 단기채권액티브' },
+        { code: '329200', name: 'KODEX 리츠' },
+        { code: '132030', name: 'KODEX 골드선물(H)' },
+        { code: '271560', name: 'KODEX WTI원유선물(H)' },
+        { code: '371460', name: 'TIGER 차이나전기차SOLACTIVE' },
+        { code: '251340', name: 'KODEX 코스닥150선물' },
+        { code: '139660', name: 'TIGER 200 IT' },
+      ],
+      substituteMap: {
+        '069500': {
+          name: 'KODEX 200',
+          substitutes: [
+            { code: '102110', name: 'TIGER 200', correlation: 0.98 },
+            { code: '229200', name: 'KODEX 200TR', correlation: 0.97 },
+          ],
+        },
+        '379800': {
+          name: 'KODEX 미국S&P500TR',
+          substitutes: [
+            { code: '360750', name: 'TIGER 미국S&P500', correlation: 0.98 },
+            { code: '449170', name: 'ACE 미국S&P500', correlation: 0.97 },
+          ],
+        },
+        '133690': {
+          name: 'TIGER 미국나스닥100',
+          substitutes: [
+            { code: '367380', name: 'ACE 미국나스닥100', correlation: 0.98 },
+            { code: '409810', name: 'KODEX 미국나스닥100TR', correlation: 0.97 },
+          ],
+        },
+      },
+    };
+
+    const state = {
+      period: 'p1',
+      dataByPeriod: null,
+      selectedPoint: null,
+      plotInitialized: false,
+    };
+
+    function fmtPct(value, digits = 1) {
+      return `${(value * 100).toFixed(digits)}%`;
+    }
+
+    function annualToMonthlyVol(annualVol) {
+      return annualVol / Math.sqrt(12);
+    }
+
+    function riskBandForAnnualVol(annualVol) {
+      const monthly = annualToMonthlyVol(annualVol);
+      return CONFIG.riskBandsMonthly.find((b) => monthly <= b.max) || CONFIG.riskBandsMonthly[CONFIG.riskBandsMonthly.length - 1];
+    }
+
+    function clamp(x, min, max) {
+      return Math.max(min, Math.min(max, x));
+    }
+
+    function randUniform(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function sampleWithoutReplacement(arr, k) {
+      const copy = arr.slice();
+      for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+      }
+      return copy.slice(0, k);
+    }
+
+    function dirichletWeights(n) {
+      const alpha = 1.0;
+      const xs = Array.from({ length: n }, () => -Math.log(Math.random()) * alpha);
+      const sum = xs.reduce((a, b) => a + b, 0);
+      return xs.map((x) => x / sum);
+    }
+
+    function makePortfolioId(prefix) {
+      return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+    }
+
+    function generateDemoInputsForPeriod(period) {
+      const base = {
+        p1: { mu: 0.085, vol: 0.085 },
+        p2: { mu: 0.105, vol: 0.105 },
+        fc: { mu: 0.095, vol: 0.095 },
+      }[period];
+
+      // DEMO: ETF별 기대수익/변동성을 임의 생성 (실제 구현 시 가격 데이터로 계산)
+      return CONFIG.etfUniverse.map((etf) => {
+        const tilt = randUniform(-0.03, 0.05);
+        const mu = clamp(base.mu + tilt, -0.10, 0.30);
+        const vol = clamp(base.vol + randUniform(-0.03, 0.10), 0.03, 0.35);
+        return { ...etf, expReturnAnnual: mu, volAnnual: vol };
+      });
+    }
+
+    function computeSharpe(expReturnAnnual, volAnnual) {
+      const excess = expReturnAnnual - CONFIG.meta.riskFreeRateAnnual;
+      return excess / Math.max(1e-9, volAnnual);
+    }
+
+    function portfolioFromHoldings(holdings, kind, label) {
+      // DEMO: 상관/공분산 없이 단순 합성 + 분산효과 팩터 적용
+      const expReturn = holdings.reduce((sum, h) => sum + h.weight * h.etf.expReturnAnnual, 0);
+      const naiveVar = holdings.reduce((sum, h) => sum + Math.pow(h.weight * h.etf.volAnnual, 2), 0);
+      const diversification = 0.78;
+      const vol = Math.sqrt(naiveVar) * diversification;
+      const sharpe = computeSharpe(expReturn, vol);
+
+      return {
+        id: makePortfolioId(kind),
+        kind,
+        label,
+        expReturnAnnual: expReturn,
+        volAnnual: vol,
+        sharpe,
+        holdings,
+      };
+    }
+
+    function generateRandomPortfolios(etfs, count) {
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        const k = Math.floor(randUniform(1, CONFIG.meta.maxAssetsInRandom + 1));
+        const picked = sampleWithoutReplacement(etfs, Math.min(k, etfs.length));
+        const ws = dirichletWeights(picked.length);
+        const holdings = picked.map((etf, idx) => ({ etf, weight: ws[idx] }));
+        out.push(portfolioFromHoldings(holdings, 'random', CONFIG.copy.portfolioKinds.random));
+      }
+      return out;
+    }
+
+    function findMaxSharpe(portfolios) {
+      return portfolios.reduce((best, p) => (p.sharpe > best.sharpe ? p : best), portfolios[0]);
+    }
+
+    function findClosestToTargetVol(portfolios, targetAnnualVol) {
+      return portfolios.reduce((best, p) => {
+        const a = Math.abs(p.volAnnual - targetAnnualVol);
+        const b = Math.abs(best.volAnnual - targetAnnualVol);
+        if (a !== b) return a < b ? p : best;
+        return p.sharpe > best.sharpe ? p : best;
+      }, portfolios[0]);
+    }
+
+    function buildEfficientFrontier(portfolios) {
+      // 간단한 DEMO: 변동성 오름차순으로 정렬 후, 수익률이 증가하는 점만 남김(상단 껍질 근사)
+      const sorted = portfolios.slice().sort((a, b) => a.volAnnual - b.volAnnual);
+      const frontier = [];
+      let bestReturn = -Infinity;
+      for (const p of sorted) {
+        if (p.expReturnAnnual > bestReturn) {
+          frontier.push(p);
+          bestReturn = p.expReturnAnnual;
+        }
+      }
+      return frontier;
+    }
+
+    function buildPeriodData(period) {
+      const etfs = generateDemoInputsForPeriod(period);
+      const randoms = generateRandomPortfolios(etfs, CONFIG.meta.randomPortfoliosCount);
+      const maxSharpe = findMaxSharpe(randoms);
+
+      const targetAnnualVol = CONFIG.meta.targetMonthlyVol * Math.sqrt(12);
+      const targetVolPick = findClosestToTargetVol(randoms, targetAnnualVol);
+
+      const frontier = buildEfficientFrontier(randoms);
+
+      const optimals = [
+        { ...maxSharpe, kind: 'optimal_sharpe', label: CONFIG.copy.portfolioKinds.optimal_sharpe },
+        { ...targetVolPick, kind: 'optimal_target_vol', label: CONFIG.copy.portfolioKinds.optimal_target_vol },
+      ];
+
+      return { etfs, randoms, optimals, frontier };
+    }
+
+    function setLastUpdated() {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const text = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      document.getElementById('lastUpdated').textContent = text;
+    }
+
+    function getSelectedPeriod() {
+      const el = document.querySelector('input[name="period"]:checked');
+      return el ? el.value : 'p1';
+    }
+
+    function clearSelection() {
+      state.selectedPoint = null;
+      renderSidebar(null);
+      renderPlot();
+    }
+
+    function explainPortfolio(p) {
+      const band = riskBandForAnnualVol(p.volAnnual);
+      const top = p.holdings
+        .slice()
+        .sort((a, b) => b.weight - a.weight)
+        .slice(0, 3)
+        .map((h) => `${h.etf.name} ${(h.weight * 100).toFixed(0)}%`)
+        .join(', ');
+
+      if (p.kind === 'optimal_target_vol') {
+        return `월 변동성 ${fmtPct(CONFIG.meta.targetMonthlyVol, 1)} 수준에 가까운 조합을 골라, 연금 투자자에게 익숙한 변동성 구간(예: ${band.name})에서의 결과 위치를 보여줍니다. 상위 비중: ${top}.`;
+      }
+      if (p.kind === 'optimal_sharpe') {
+        return `샤프 비율(위험 대비 초과수익)이 상대적으로 높은 포인트를 대표로 표시합니다. 이는 “정답”이 아니라 과거 데이터 기반 공간에서의 한 기준점입니다. 상위 비중: ${top}.`;
+      }
+      return `선택한 포트폴리오의 위치와 구성을 확인하세요. 변동성 구간: ${band.name}. 상위 비중: ${top}.`;
+    }
+
+    function renderRecommendCards(periodData) {
+      const container = document.getElementById('recommendCards');
+      container.innerHTML = '';
+
+      const cards = periodData.optimals.map((p) => {
+        return {
+          title: p.label,
+          ret: fmtPct(p.expReturnAnnual, 1),
+          vol: fmtPct(p.volAnnual, 2),
+          sharpe: p.sharpe.toFixed(2),
+          id: p.id,
+        };
+      });
+
+      for (const c of cards) {
+        const el = document.createElement('div');
+        el.className = 'border rounded-4 p-3';
+        el.innerHTML = `
+          <div class="d-flex align-items-start justify-content-between gap-2">
+            <div>
+              <div class="fw-bold">${escapeHtml(c.title)}</div>
+              <div class="small-muted">수익률: <span class="mono">${escapeHtml(c.ret)}</span> · 변동성: <span class="mono">${escapeHtml(c.vol)}</span> · 샤프: <span class="mono">${escapeHtml(c.sharpe)}</span></div>
+            </div>
+            <button class="btn btn-sm btn-soft" type="button" data-jump="${escapeHtml(c.id)}">상세보기</button>
+          </div>
+        `;
+        container.appendChild(el);
+      }
+
+      container.querySelectorAll('button[data-jump]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-jump');
+          const all = [...periodData.optimals, ...periodData.randoms];
+          const found = all.find((p) => p.id === id);
+          if (found) {
+            state.selectedPoint = { kind: found.kind, id: found.id };
+            renderSidebar(found);
+            renderPlot();
+          }
+        });
+      });
+    }
+
+    function renderSidebar(portfolio) {
+      const empty = document.getElementById('sidebarEmpty');
+      const content = document.getElementById('sidebarContent');
+
+      if (!portfolio) {
+        empty.classList.remove('d-none');
+        content.classList.add('d-none');
+        return;
+      }
+
+      empty.classList.add('d-none');
+      content.classList.remove('d-none');
+
+      const band = riskBandForAnnualVol(portfolio.volAnnual);
+      const bandMonthly = annualToMonthlyVol(portfolio.volAnnual);
+
+      document.getElementById('portfolioTitle').textContent = portfolio.label;
+      document.getElementById('portfolioSubtitle').textContent = CONFIG.copy.periodNames[state.period];
+
+      const chip = document.getElementById('riskChip');
+      chip.textContent = `${band.name} (${fmtPct(bandMonthly, 1)}/월)`;
+      chip.style.color = bandMonthly <= 0.02 ? '#111827' : '#ffffff';
+      chip.style.background = band.color;
+      chip.style.padding = '6px 10px';
+      chip.style.borderRadius = '999px';
+      chip.style.display = 'inline-block';
+
+      document.getElementById('metricReturn').textContent = fmtPct(portfolio.expReturnAnnual, 1);
+      document.getElementById('metricVol').textContent = fmtPct(portfolio.volAnnual, 2);
+      document.getElementById('metricSharpe').textContent = portfolio.sharpe.toFixed(2);
+
+      const holdings = portfolio.holdings.slice().sort((a, b) => b.weight - a.weight);
+      const list = document.getElementById('holdingsList');
+      list.innerHTML = '';
+
+      for (const h of holdings) {
+        const row = document.createElement('div');
+        row.className = 'mb-2';
+        const pct = h.weight * 100;
+        const hasSubs = !!CONFIG.substituteMap[h.etf.code];
+
+        row.innerHTML = `
+          <div class="d-flex align-items-center justify-content-between gap-2">
+            <div class="fw-bold" style="font-size: 14px;">${escapeHtml(h.etf.name)} <span class="text-muted mono">(${escapeHtml(h.etf.code)})</span></div>
+            <div class="d-flex align-items-center gap-2">
+              <div class="mono fw-bold">${pct.toFixed(1)}%</div>
+              <button class="btn btn-sm ${hasSubs ? 'btn-outline-primary' : 'btn-outline-secondary'}" type="button" ${hasSubs ? '' : 'disabled'} data-sub="${escapeHtml(h.etf.code)}">대체</button>
+            </div>
+          </div>
+          <div class="progress mt-1">
+            <div class="progress-bar" role="progressbar" style="width: ${pct.toFixed(2)}%; background: #0d6efd;"></div>
+          </div>
+        `;
+
+        list.appendChild(row);
+      }
+
+      list.querySelectorAll('button[data-sub]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const code = btn.getAttribute('data-sub');
+          openSubstitutes(code);
+        });
+      });
+
+      document.getElementById('explainText').textContent = explainPortfolio(portfolio);
+    }
+
+    function openSubstitutes(code) {
+      const entry = CONFIG.substituteMap[code];
+      const tbody = document.getElementById('subTableBody');
+      tbody.innerHTML = '';
+
+      if (!entry) return;
+
+      for (const s of entry.substitutes) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><div class="fw-bold">${escapeHtml(entry.name)}</div><div class="small-muted mono">${escapeHtml(code)}</div></td>
+          <td><div class="fw-bold">${escapeHtml(s.name)}</div><div class="small-muted mono">${escapeHtml(s.code)}</div></td>
+          <td class="text-end mono fw-bold">${Number(s.correlation).toFixed(2)}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      const modal = new bootstrap.Modal(document.getElementById('subModal'));
+      modal.show();
+    }
+
+    function buildPlotTraces(periodData) {
+      const randomX = periodData.randoms.map((p) => p.volAnnual * 100);
+      const randomY = periodData.randoms.map((p) => p.expReturnAnnual * 100);
+      const randomHover = periodData.randoms.map((p) => {
+        return `${escapeHtml(p.label)}<br>수익률: ${fmtPct(p.expReturnAnnual, 1)}<br>변동성: ${fmtPct(p.volAnnual, 2)}<br>샤프: ${p.sharpe.toFixed(2)}<br><span class="mono">클릭하여 상세보기</span>`;
+      });
+
+      const frontierX = periodData.frontier.map((p) => p.volAnnual * 100);
+      const frontierY = periodData.frontier.map((p) => p.expReturnAnnual * 100);
+
+      const optimals = periodData.optimals;
+      const optX = optimals.map((p) => p.volAnnual * 100);
+      const optY = optimals.map((p) => p.expReturnAnnual * 100);
+      const optHover = optimals.map((p) => {
+        return `${escapeHtml(p.label)}<br>수익률: ${fmtPct(p.expReturnAnnual, 1)}<br>변동성: ${fmtPct(p.volAnnual, 2)}<br>샤프: ${p.sharpe.toFixed(2)}<br><span class="mono">클릭하여 상세보기</span>`;
+      });
+
+      const randomTrace = {
+        type: 'scattergl',
+        mode: 'markers',
+        name: '랜덤 포트폴리오 (DEMO)',
+        x: randomX,
+        y: randomY,
+        text: randomHover,
+        hoverinfo: 'text',
+        marker: { color: CONFIG.colors.random, size: 6 },
+        customdata: periodData.randoms.map((p) => ({ kind: p.kind, id: p.id })),
+      };
+
+      const frontierTrace = {
+        type: 'scatter',
+        mode: 'lines',
+        name: '효율적 프론티어 (DEMO)',
+        x: frontierX,
+        y: frontierY,
+        line: { color: CONFIG.colors.frontier, width: 3 },
+        hoverinfo: 'skip',
+      };
+
+      const optimalTrace = {
+        type: 'scatter',
+        mode: 'markers',
+        name: '최적 포트폴리오 (DEMO)',
+        x: optX,
+        y: optY,
+        text: optHover,
+        hoverinfo: 'text',
+        marker: { color: CONFIG.colors.optimal, size: 16, symbol: 'star' },
+        customdata: optimals.map((p) => ({ kind: p.kind, id: p.id })),
+      };
+
+      let selectedTrace = null;
+      if (state.selectedPoint) {
+        const all = [...periodData.optimals, ...periodData.randoms];
+        const p = all.find((x) => x.id === state.selectedPoint.id);
+        if (p) {
+          selectedTrace = {
+            type: 'scatter',
+            mode: 'markers',
+            name: '선택됨',
+            x: [p.volAnnual * 100],
+            y: [p.expReturnAnnual * 100],
+            hoverinfo: 'skip',
+            marker: { color: CONFIG.colors.selected, size: 18, symbol: 'circle-open', line: { color: CONFIG.colors.selected, width: 3 } },
+          };
+        }
+      }
+
+      return selectedTrace ? [randomTrace, frontierTrace, optimalTrace, selectedTrace] : [randomTrace, frontierTrace, optimalTrace];
+    }
+
+    function buildRiskBandShapes() {
+      // 월 변동성 구간을 연 변동성(%) 축으로 환산해서 배경 세로 밴드로 표시
+      const shapes = [];
+      let prevAnnual = 0;
+      for (const band of CONFIG.riskBandsMonthly) {
+        const maxAnnual = band.max === Infinity ? 1.0 : (band.max * Math.sqrt(12));
+        shapes.push({
+          type: 'rect',
+          xref: 'x',
+          yref: 'paper',
+          x0: prevAnnual * 100,
+          x1: maxAnnual * 100,
+          y0: 0,
+          y1: 1,
+          fillcolor: band.color,
+          opacity: 0.06,
+          line: { width: 0 },
+          layer: 'below',
+        });
+        prevAnnual = maxAnnual;
+        if (band.max === Infinity) break;
+      }
+      return shapes;
+    }
+
+    function renderPlot() {
+      const periodData = state.dataByPeriod[state.period];
+      const traces = buildPlotTraces(periodData);
+
+      const layout = {
+        margin: { l: 60, r: 20, t: 10, b: 60 },
+        xaxis: {
+          title: '연환산 변동성 (%)',
+          range: [0, 30],
+          gridcolor: 'rgba(0,0,0,0.06)',
+          zeroline: false,
+        },
+        yaxis: {
+          title: '연환산 기대수익률 (%)',
+          gridcolor: 'rgba(0,0,0,0.06)',
+          zeroline: false,
+        },
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: '#ffffff',
+        legend: { orientation: 'h', y: -0.22 },
+        shapes: buildRiskBandShapes(),
+        annotations: [
+          {
+            xref: 'paper', yref: 'paper', x: 1, y: 1.02,
+            xanchor: 'right', yanchor: 'bottom',
+            text: 'DEMO',
+            showarrow: false,
+            font: { size: 12, color: '#7a5a00' },
+            bgcolor: 'rgba(255,193,7,0.14)',
+            bordercolor: 'rgba(255,193,7,0.35)',
+            borderwidth: 1,
+            borderpad: 4,
+          },
+        ],
+      };
+
+      const config = {
+        responsive: true,
+        displaylogo: false,
+      };
+
+      const plotEl = document.getElementById('plot');
+
+      if (!state.plotInitialized) {
+        Plotly.newPlot(plotEl, traces, layout, config);
+        state.plotInitialized = true;
+
+        plotEl.on('plotly_click', (ev) => {
+          if (!ev || !ev.points || ev.points.length === 0) return;
+          const pt = ev.points[0];
+          const meta = pt.customdata;
+          if (!meta || !meta.id) return;
+
+          const all = [...periodData.optimals, ...periodData.randoms];
+          const found = all.find((p) => p.id === meta.id);
+          if (!found) return;
+
+          state.selectedPoint = { kind: found.kind, id: found.id };
+          renderSidebar(found);
+          renderPlot();
+        });
+
+        return;
+      }
+
+      Plotly.react(plotEl, traces, layout, config);
+    }
+
+    function runAnalysis() {
+      state.period = getSelectedPeriod();
+
+      if (!state.dataByPeriod) state.dataByPeriod = {};
+
+      // DEMO: 선택한 기간만 재계산
+      state.dataByPeriod[state.period] = buildPeriodData(state.period);
+      renderRecommendCards(state.dataByPeriod[state.period]);
+      clearSelection();
+      renderPlot();
+    }
+
+    function randomizeAll() {
+      state.dataByPeriod = {
+        p1: buildPeriodData('p1'),
+        p2: buildPeriodData('p2'),
+        fc: buildPeriodData('fc'),
+      };
+      renderRecommendCards(state.dataByPeriod[state.period]);
+      clearSelection();
+      renderPlot();
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    function wireUI() {
+      document.getElementById('btnRun').addEventListener('click', runAnalysis);
+      document.getElementById('btnRandomize').addEventListener('click', randomizeAll);
+      document.getElementById('btnResetSelection').addEventListener('click', clearSelection);
+
+      document.querySelectorAll('input[name="period"]').forEach((el) => {
+        el.addEventListener('change', () => {
+          state.period = getSelectedPeriod();
+          renderRecommendCards(state.dataByPeriod[state.period]);
+          clearSelection();
+          renderPlot();
+        });
+      });
+    }
+
+    function init() {
+      setLastUpdated();
+      wireUI();
+
+      // 초기 데이터 생성
+      state.dataByPeriod = {
+        p1: buildPeriodData('p1'),
+        p2: buildPeriodData('p2'),
+        fc: buildPeriodData('fc'),
+      };
+
+      renderRecommendCards(state.dataByPeriod[state.period]);
+      renderSidebar(null);
+      renderPlot();
+    }
+
+    init();
+  </script>
+</body>
+</html>
+
