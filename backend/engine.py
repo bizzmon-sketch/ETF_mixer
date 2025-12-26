@@ -1,0 +1,1201 @@
+﻿from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+import logging
+import os
+import sqlite3
+import threading
+import time
+from typing import Dict, Iterable, List, Tuple
+import hashlib
+import random
+
+import numpy as np
+import pandas as pd
+import FinanceDataReader as fdr
+
+CONFIG = {
+  "etf_list_path": "data/etf_list.csv",
+  "price_db_path": "data/prices.sqlite",
+  "months": 6,
+  "min_observations": 90,
+  "trading_days_month": 21,
+  "cache_ttl_sec": 600,
+  "refresh_buffer_days": 3,
+  "refresh_interval_sec": 600,
+  "refresh_missing_batch_size": 80,
+  "portfolio_candidate_limit": 20,
+  "portfolio_max_holdings": 10,
+  "portfolio_min_weight": 5,
+  "portfolio_max_weight": 30,
+  "portfolio_weight_step": 5,
+  "fdr_source": None,
+}
+
+RISK_BUCKETS: List[Tuple[float, float, str]] = [
+  (0.0, 3.0, "0-3%"),
+  (3.0, 6.0, "3-6%"),
+  (6.0, 9.0, "6-9%"),
+  (9.0, 12.0, "9-12%"),
+  (12.0, 15.0, "12-15%"),
+]
+RISK_BUCKET_LABELS = [label for _, _, label in RISK_BUCKETS] + ["15%+"]
+ASSET_CLASSES = ["Equity", "Bond", "Alt", "CashLike"]
+PORTFOLIO_VERSION = "sampled-v1"
+PORTFOLIO_SEED_SALT = f"ETF_mixer|{PORTFOLIO_VERSION}"
+
+_CACHE: Dict[str, object] = {
+  "timestamp": None,
+  "metrics": None,
+  "recommendations": None,
+  "delta3m": None,
+  "refresh_mode": None,
+  "cached_at": None,
+  "data_asof": None,
+}
+
+logger = logging.getLogger(__name__)
+
+last_refresh_ts: float | None = None
+refresh_lock = threading.Lock()
+refresh_in_progress = False
+
+
+def load_etf_list(path: str = CONFIG["etf_list_path"]) -> pd.DataFrame:
+  df = pd.read_csv(path, encoding="utf-8-sig")
+  df = df[["Code", "Name"]].dropna().drop_duplicates().reset_index(drop=True)
+  return df
+
+
+def fetch_close_prices(codes: List[str], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+  frames = []
+  source = CONFIG.get("fdr_source")
+  for code in codes:
+    try:
+      if source:
+        data = fdr.DataReader(code, start, end, data_source=source)
+      else:
+        data = fdr.DataReader(code, start, end)
+    except Exception:
+      continue
+    if "Close" not in data.columns:
+      continue
+    series = data["Close"].rename(code)
+    frames.append(series)
+  if not frames:
+    return pd.DataFrame()
+  close = pd.concat(frames, axis=1).sort_index()
+  return close
+
+
+def _ensure_db_dir(db_path: str) -> None:
+  folder = os.path.dirname(db_path)
+  if folder and not os.path.isdir(folder):
+    os.makedirs(folder, exist_ok=True)
+
+
+def _connect_db() -> sqlite3.Connection:
+  db_path = CONFIG["price_db_path"]
+  _ensure_db_dir(db_path)
+  return sqlite3.connect(db_path)
+
+
+def _init_db(conn: sqlite3.Connection) -> None:
+  conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS prices (
+      code TEXT NOT NULL,
+      date TEXT NOT NULL,
+      close REAL NOT NULL,
+      PRIMARY KEY(code, date)
+    )
+    """
+  )
+  conn.commit()
+
+
+def _chunked(values: Iterable[str], size: int) -> Iterable[List[str]]:
+  batch = []
+  for value in values:
+    batch.append(value)
+    if len(batch) >= size:
+      yield batch
+      batch = []
+  if batch:
+    yield batch
+
+
+def _fetch_last_dates(conn: sqlite3.Connection, codes: List[str]) -> Dict[str, str]:
+  if not codes:
+    return {}
+  last_dates: Dict[str, str] = {}
+  for chunk in _chunked(codes, 900):
+    placeholders = ",".join("?" for _ in chunk)
+    query = f"""
+      SELECT code, MAX(date) AS max_date
+      FROM prices
+      WHERE code IN ({placeholders})
+      GROUP BY code
+    """
+    for code, max_date in conn.execute(query, chunk):
+      if max_date:
+        last_dates[code] = max_date
+  return last_dates
+
+
+def _upsert_prices(conn: sqlite3.Connection, rows: List[Tuple[str, str, float]]) -> None:
+  if not rows:
+    return
+  conn.executemany(
+    """
+    INSERT INTO prices (code, date, close)
+    VALUES (?, ?, ?)
+    ON CONFLICT(code, date) DO UPDATE SET close=excluded.close
+    """,
+    rows,
+  )
+
+
+def _fetch_series_from_reader(code: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series | None:
+  source = CONFIG.get("fdr_source")
+  try:
+    if source:
+      data = fdr.DataReader(code, start, end, data_source=source)
+    else:
+      data = fdr.DataReader(code, start, end)
+  except Exception:
+    return None
+  if "Close" not in data.columns:
+    return None
+  series = data["Close"].dropna()
+  if series.empty:
+    return None
+  return series
+
+
+def update_prices_incremental(codes: List[str], buffer_days: int = 10) -> None:
+  if not codes:
+    return
+  end = pd.Timestamp.today().normalize()
+  default_start = end - pd.DateOffset(months=CONFIG["months"])
+  buffer_days = min(int(buffer_days), 10)
+  with _connect_db() as conn:
+    _init_db(conn)
+    last_dates = _fetch_last_dates(conn, codes)
+    for code in codes:
+      try:
+        last_date_str = last_dates.get(code)
+        if last_date_str:
+          try:
+            last_date = pd.Timestamp(last_date_str)
+          except Exception:
+            last_date = None
+        else:
+          last_date = None
+        start = default_start
+        if last_date is not None:
+          start = last_date - pd.Timedelta(days=buffer_days)
+        series = _fetch_series_from_reader(code, start, end)
+        if series is None:
+          continue
+        rows = [
+          (code, idx.strftime("%Y-%m-%d"), float(value))
+          for idx, value in series.items()
+        ]
+        _upsert_prices(conn, rows)
+        conn.commit()
+      except Exception as exc:
+        logger.warning("price update failed for %s: %s", code, exc)
+        continue
+
+
+def load_close_prices(codes: List[str], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+  if not codes:
+    return pd.DataFrame()
+  start_str = start.strftime("%Y-%m-%d")
+  end_str = end.strftime("%Y-%m-%d")
+  frames = []
+  with _connect_db() as conn:
+    _init_db(conn)
+    for chunk in _chunked(codes, 900):
+      placeholders = ",".join("?" for _ in chunk)
+      query = f"""
+        SELECT code, date, close
+        FROM prices
+        WHERE code IN ({placeholders})
+          AND date BETWEEN ? AND ?
+      """
+      params = list(chunk) + [start_str, end_str]
+      df = pd.read_sql_query(query, conn, params=params)
+      if df.empty:
+        continue
+      frames.append(df)
+  if not frames:
+    return pd.DataFrame()
+  all_rows = pd.concat(frames, ignore_index=True)
+  all_rows["date"] = pd.to_datetime(all_rows["date"])
+  close = all_rows.pivot_table(index="date", columns="code", values="close", aggfunc="last")
+  return close.sort_index()
+
+
+def load_recent_prices(code: str, days: int = 120) -> List[Dict[str, object]]:
+  if not code:
+    return []
+  try:
+    days = int(days)
+  except Exception:
+    days = 120
+  if days <= 0:
+    days = 120
+  rows: List[Dict[str, object]] = []
+  with _connect_db() as conn:
+    _init_db(conn)
+    query = """
+      SELECT date, close
+      FROM prices
+      WHERE code = ?
+      ORDER BY date DESC
+      LIMIT ?
+    """
+    for date_value, close in conn.execute(query, (code, days)):
+      rows.append({
+        "date": date_value,
+        "close": float(close),
+      })
+  rows.reverse()
+  return rows
+
+
+def classify_risk(risk_pct: float) -> str | None:
+  if np.isnan(risk_pct):
+    return None
+  for low, high, label in RISK_BUCKETS:
+    if low <= risk_pct < high:
+      return label
+  if risk_pct >= RISK_BUCKETS[-1][1]:
+    return "15%+"
+  return None
+
+
+def compute_metrics(etf_df: pd.DataFrame, close: pd.DataFrame) -> pd.DataFrame:
+  if close.empty:
+    return pd.DataFrame(columns=["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"])
+
+  counts = close.count()
+  eligible = counts[counts >= CONFIG["min_observations"]].index.tolist()
+  close = close[eligible].dropna(how="all")
+  if close.empty:
+    return pd.DataFrame(columns=["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"])
+
+  returns = close.pct_change().dropna(how="all")
+  return_6m = (close.iloc[-1] / close.iloc[0]) - 1
+  vol_month = returns.std() * np.sqrt(CONFIG["trading_days_month"])
+  risk_pct = vol_month * 100
+
+  metrics = pd.DataFrame({
+    "Code": return_6m.index,
+    "return_6m": return_6m.values,
+    "risk_6m": vol_month.values,
+    "risk_pct": risk_pct.values,
+  })
+  metrics["risk_bucket"] = metrics["risk_pct"].apply(classify_risk)
+  metrics = metrics.merge(etf_df, on="Code", how="left")
+  metrics = metrics[["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"]]
+  return metrics
+
+
+def compute_delta3m(close: pd.DataFrame) -> pd.DataFrame:
+  if close.empty:
+    return pd.DataFrame(columns=["Code", "return_prev3m", "return_recent3m", "delta_3m"])
+
+  end = close.index.max()
+  start = end - pd.DateOffset(months=CONFIG["months"])
+  mid = end - pd.DateOffset(months=3)
+  close_6m = close.loc[close.index >= start]
+  if close_6m.empty:
+    return pd.DataFrame(columns=["Code", "return_prev3m", "return_recent3m", "delta_3m"])
+
+  records = []
+  for code in close_6m.columns:
+    series = close_6m[code].dropna()
+    if series.empty:
+      continue
+    series_prev = series.loc[series.index <= mid]
+    series_recent = series.loc[series.index >= mid]
+    if series_prev.empty or series_recent.empty:
+      continue
+    start_price = series_prev.iloc[0]
+    mid_price = series_prev.iloc[-1]
+    end_price = series_recent.iloc[-1]
+    if start_price == 0 or mid_price == 0:
+      continue
+    return_prev = (mid_price / start_price) - 1
+    return_recent = (end_price / mid_price) - 1
+    records.append({
+      "Code": code,
+      "return_prev3m": return_prev,
+      "return_recent3m": return_recent,
+      "delta_3m": return_recent - return_prev,
+    })
+
+  return pd.DataFrame.from_records(records)
+
+
+def select_best_by_bucket(metrics: pd.DataFrame) -> pd.DataFrame:
+  if metrics.empty:
+    return pd.DataFrame(columns=["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"])
+  filtered = metrics.dropna(subset=["risk_bucket"])
+  if filtered.empty:
+    return pd.DataFrame(columns=["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"])
+  best = filtered.sort_values(["risk_bucket", "return_6m"], ascending=[True, False])
+  best = best.groupby("risk_bucket", as_index=False).head(1)
+  return best.reset_index(drop=True)
+
+
+def classify_asset_class(name: str) -> str:
+  if not name:
+    return "Equity"
+  raw = str(name)
+  lowered = raw.lower()
+  cashlike_lower = ["mmf", "cdbond", "kofr", "koribor", "cash"]
+  cashlike_raw = ["현금", "단기", "초단기", "머니", "콜", "통안", "단기채"]
+  alt_lower = ["reit", "commodity", "commodities"]
+  alt_raw = ["리츠", "금", "은", "원유", "원자재", "희토류"]
+  bond_lower = ["bond", "credit"]
+  bond_raw = ["채권", "국채", "회사채", "국고", "공채", "크레딧", "듀레이션"]
+
+  if any(keyword in lowered for keyword in cashlike_lower):
+    return "CashLike"
+  if any(keyword in raw for keyword in cashlike_raw):
+    return "CashLike"
+  if any(keyword in lowered for keyword in alt_lower):
+    return "Alt"
+  if any(keyword in raw for keyword in alt_raw):
+    return "Alt"
+  if any(keyword in lowered for keyword in bond_lower):
+    return "Bond"
+  if any(keyword in raw for keyword in bond_raw):
+    return "Bond"
+  return "Equity"
+
+
+def _sort_candidates(df: pd.DataFrame) -> pd.DataFrame:
+  return df.sort_values(["return_6m", "risk_pct", "Code"], ascending=[False, True, True])
+
+
+def _allocate_portfolio_weights(
+  holdings: List[Dict[str, object]],
+  bucket_label: str,
+) -> Dict[str, int]:
+  min_w = int(CONFIG["portfolio_min_weight"])
+  max_w = int(CONFIG["portfolio_max_weight"])
+  step = int(CONFIG["portfolio_weight_step"])
+  weights: Dict[str, int] = {h["Code"]: min_w for h in holdings}
+  remaining = 100 - (min_w * len(holdings))
+
+  bucket_bias = 0.0
+  if bucket_label in ("12-15%", "15%+"):
+    bucket_bias = 1.0
+  elif bucket_label in ("9-12%", "6-9%"):
+    bucket_bias = 0.5
+  else:
+    bucket_bias = -0.5
+
+  def score(holding: Dict[str, object]) -> float:
+    base = float(holding["return_6m"])
+    asset_class = holding["asset_class"]
+    if asset_class in ("Equity", "Alt"):
+      return base + bucket_bias
+    if asset_class in ("Bond", "CashLike"):
+      return base - bucket_bias
+    return base
+
+  non_cash = [h for h in holdings if h["asset_class"] != "CashLike"]
+  non_cash = sorted(non_cash, key=lambda h: (-score(h), h["Code"]))
+  cashlike = [h for h in holdings if h["asset_class"] == "CashLike"]
+  if cashlike:
+    cashlike = sorted(cashlike, key=lambda h: (-score(h), h["Code"]))
+  else:
+    cashlike = []
+
+  while remaining > 0:
+    progressed = False
+    for holding in non_cash:
+      code = holding["Code"]
+      if weights[code] >= max_w:
+        continue
+      if remaining < step:
+        break
+      weights[code] += step
+      remaining -= step
+      progressed = True
+      if remaining == 0:
+        break
+    if not progressed:
+      break
+
+  for holding in cashlike:
+    code = holding["Code"]
+    while remaining > 0 and weights[code] < max_w:
+      if remaining < step:
+        break
+      weights[code] += step
+      remaining -= step
+
+  if remaining > 0:
+    logger.warning("portfolio allocation leftover: %s", remaining)
+  return weights
+
+
+def _build_portfolio_for_bucket(metrics: pd.DataFrame, bucket_label: str) -> Dict[str, object] | None:
+  bucket_df = metrics.loc[metrics["risk_bucket"] == bucket_label].copy()
+  if bucket_df.empty:
+    return None
+  bucket_df = bucket_df.dropna(subset=["Code", "Name", "return_6m", "risk_pct"])
+  bucket_df["asset_class"] = bucket_df["Name"].apply(classify_asset_class)
+
+  candidates_by_class: Dict[str, pd.DataFrame] = {}
+  limit = int(CONFIG["portfolio_candidate_limit"])
+  for asset_class in ASSET_CLASSES:
+    class_df = bucket_df[bucket_df["asset_class"] == asset_class]
+    if class_df.empty:
+      return None
+    candidates_by_class[asset_class] = _sort_candidates(class_df).head(limit)
+
+  holdings_rows: List[Dict[str, object]] = []
+  used_codes: set[str] = set()
+  for asset_class in ASSET_CLASSES:
+    top = candidates_by_class[asset_class].iloc[0]
+    holdings_rows.append({
+      "Code": top["Code"],
+      "Name": top["Name"],
+      "return_6m": float(top["return_6m"]),
+      "risk_pct": float(top["risk_pct"]),
+      "asset_class": asset_class,
+    })
+    used_codes.add(top["Code"])
+
+  extra_pool = pd.concat(
+    [candidates_by_class["Equity"], candidates_by_class["Bond"], candidates_by_class["Alt"]],
+    ignore_index=True,
+  )
+  extra_pool = _sort_candidates(extra_pool)
+  max_holdings = int(CONFIG["portfolio_max_holdings"])
+  for _, row in extra_pool.iterrows():
+    if len(holdings_rows) >= max_holdings:
+      break
+    if row["Code"] in used_codes:
+      continue
+    holdings_rows.append({
+      "Code": row["Code"],
+      "Name": row["Name"],
+      "return_6m": float(row["return_6m"]),
+      "risk_pct": float(row["risk_pct"]),
+      "asset_class": row["asset_class"],
+    })
+    used_codes.add(row["Code"])
+
+  weights = _allocate_portfolio_weights(holdings_rows, bucket_label)
+
+  holdings_output = []
+  for holding in holdings_rows:
+    code = holding["Code"]
+    weight = weights.get(code, 0)
+    if weight <= 0:
+      continue
+    holdings_output.append({
+      "Code": code,
+      "Name": holding["Name"],
+      "weight": weight,
+      "asset_class": holding["asset_class"],
+      "return_6m": holding["return_6m"],
+      "risk_pct": holding["risk_pct"],
+    })
+
+  holdings_output = sorted(
+    holdings_output,
+    key=lambda h: (-h["weight"], h["Code"]),
+  )
+
+  total_weight = sum(h["weight"] for h in holdings_output)
+  if total_weight != 100:
+    logger.warning("portfolio weights sum %s for bucket %s", total_weight, bucket_label)
+
+  total_return = sum((h["weight"] / 100) * h["return_6m"] for h in holdings_output)
+  total_risk = sum((h["weight"] / 100) * h["risk_pct"] for h in holdings_output)
+
+  return {
+    "risk_bucket": bucket_label,
+    "return_6m": total_return,
+    "risk_pct": total_risk,
+    "holdings": [
+      {
+        "Code": h["Code"],
+        "Name": h["Name"],
+        "weight": h["weight"],
+        "asset_class": h["asset_class"],
+      }
+      for h in holdings_output
+    ],
+  }
+
+
+def _get_data_asof(close: pd.DataFrame) -> str | None:
+  if close.empty:
+    return None
+  last_dates = []
+  for code in close.columns:
+    series = close[code].dropna()
+    if series.empty:
+      continue
+    last_dates.append(series.index.max())
+  if not last_dates:
+    return None
+  ts = min(last_dates)
+  if isinstance(ts, pd.Timestamp):
+    return ts.strftime("%Y-%m-%d")
+  return None
+
+
+def _now_kst() -> datetime:
+  return datetime.now(timezone(timedelta(hours=9)))
+
+
+def _maybe_start_background_refresh(codes: List[str]) -> str:
+  global last_refresh_ts, refresh_in_progress
+  now = time.time()
+  with refresh_lock:
+    if refresh_in_progress:
+      return "inflight"
+    if last_refresh_ts is not None:
+      if now - last_refresh_ts < CONFIG["refresh_interval_sec"]:
+        return "skipped"
+    refresh_in_progress = True
+    last_refresh_ts = now
+
+  thread = threading.Thread(
+    target=_background_refresh,
+    args=(codes,),
+    daemon=True,
+  )
+  thread.start()
+  return "started"
+
+
+def _background_refresh(codes: List[str]) -> None:
+  global refresh_in_progress
+  try:
+    refresh_buffer = min(max(int(CONFIG["refresh_buffer_days"]), 3), 10)
+    missing_codes: List[str] = []
+    codes_with_last: List[str] = []
+    with _connect_db() as conn:
+      _init_db(conn)
+      last_dates = _fetch_last_dates(conn, codes)
+    for code in codes:
+      if code in last_dates:
+        codes_with_last.append(code)
+      else:
+        missing_codes.append(code)
+    if codes_with_last:
+      update_prices_incremental(codes_with_last, buffer_days=refresh_buffer)
+    if missing_codes:
+      batch_size = int(CONFIG["refresh_missing_batch_size"])
+      for batch in _chunked(missing_codes, batch_size):
+        update_prices_incremental(batch, buffer_days=refresh_buffer)
+  finally:
+    with refresh_lock:
+      refresh_in_progress = False
+    _CACHE["timestamp"] = None
+
+
+def _refresh_cache_from_db() -> None:
+  etf_df = load_etf_list()
+  codes = etf_df["Code"].tolist()
+  end = pd.Timestamp.today().normalize()
+  start = end - pd.DateOffset(months=CONFIG["months"])
+  close = load_close_prices(codes, start, end)
+
+  metrics = compute_metrics(etf_df, close)
+  recommendations = select_best_by_bucket(metrics)
+  delta3m = compute_delta3m(close)
+
+  cached_at = _now_kst()
+  _CACHE["timestamp"] = time.time()
+  _CACHE["cached_at"] = cached_at.isoformat(timespec="seconds")
+  _CACHE["data_asof"] = _get_data_asof(close)
+  _CACHE["metrics"] = metrics
+  _CACHE["recommendations"] = recommendations
+  _CACHE["delta3m"] = delta3m
+
+
+def _get_cache() -> None:
+  ts = _CACHE["timestamp"]
+  if ts is None:
+    _refresh_cache_from_db()
+    refresh_status = _maybe_start_background_refresh(load_etf_list()["Code"].tolist())
+    if refresh_status == "started":
+      _CACHE["refresh_mode"] = "bg_refresh_started"
+    elif refresh_status == "inflight":
+      _CACHE["refresh_mode"] = "bg_refresh_inflight"
+    else:
+      _CACHE["refresh_mode"] = "db_immediate"
+    return
+  age = time.time() - ts
+  if age > CONFIG["cache_ttl_sec"]:
+    _refresh_cache_from_db()
+    refresh_status = _maybe_start_background_refresh(load_etf_list()["Code"].tolist())
+    if refresh_status == "started":
+      _CACHE["refresh_mode"] = "bg_refresh_started"
+    elif refresh_status == "inflight":
+      _CACHE["refresh_mode"] = "bg_refresh_inflight"
+    else:
+      _CACHE["refresh_mode"] = "db_immediate"
+    return
+  refresh_status = _maybe_start_background_refresh(load_etf_list()["Code"].tolist())
+  if refresh_status == "started":
+    _CACHE["refresh_mode"] = "bg_refresh_started"
+  elif refresh_status == "inflight":
+    _CACHE["refresh_mode"] = "bg_refresh_inflight"
+  else:
+    _CACHE["refresh_mode"] = "cache_hit"
+
+
+def _df_to_records(df: pd.DataFrame) -> List[Dict[str, object]]:
+  records = df.to_dict(orient="records")
+  cleaned = []
+  for rec in records:
+    cleaned_rec = {}
+    for key, value in rec.items():
+      if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+        cleaned_rec[key] = None
+      else:
+        cleaned_rec[key] = value
+    cleaned.append(cleaned_rec)
+  return cleaned
+
+
+def get_scatter_data() -> List[Dict[str, object]]:
+  _get_cache()
+  metrics = _CACHE["metrics"]
+  return _df_to_records(metrics)
+
+
+def get_scatter_meta() -> Dict[str, object]:
+  if _CACHE["timestamp"] is None:
+    _get_cache()
+  if last_refresh_ts is None:
+    last_refresh_value = None
+  else:
+    last_refresh_value = datetime.fromtimestamp(
+      last_refresh_ts,
+      timezone(timedelta(hours=9)),
+    ).isoformat(timespec="seconds")
+  return {
+    "refresh_mode": _CACHE.get("refresh_mode"),
+    "cached_at": _CACHE.get("cached_at"),
+    "data_asof": _CACHE.get("data_asof"),
+    "last_refresh_ts": last_refresh_value,
+  }
+
+
+def get_recommendations() -> List[Dict[str, object]]:
+  _get_cache()
+  recommendations = _CACHE["recommendations"]
+  return _df_to_records(recommendations)
+
+
+def get_delta3m() -> List[Dict[str, object]]:
+  _get_cache()
+  delta3m = _CACHE["delta3m"]
+  return _df_to_records(delta3m)
+
+
+def _bucket_bounds() -> List[Dict[str, object]]:
+  bounds = []
+  for low, high, label in RISK_BUCKETS:
+    bounds.append({"label": label, "min": low, "max": high})
+  bounds.append({"label": "15%+", "min": 15.0, "max": None})
+  return bounds
+
+
+def _risk_in_bucket(risk_pct: float, bucket: Dict[str, object]) -> bool:
+  if risk_pct is None:
+    return False
+  if bucket["max"] is None:
+    return risk_pct >= float(bucket["min"])
+  return float(bucket["min"]) <= risk_pct < float(bucket["max"])
+
+
+def _bucket_target(bucket: Dict[str, object]) -> float:
+  if bucket["max"] is None:
+    return float(bucket["min"])
+  return (float(bucket["min"]) + float(bucket["max"])) / 2
+
+
+def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> Dict[str, List[Dict[str, object]]]:
+  df = metrics.dropna(subset=["Code", "Name", "return_6m", "risk_pct"]).copy()
+  if df.empty:
+    return {}
+  df["asset_class"] = df["Name"].apply(classify_asset_class)
+  df = _sort_candidates(df)
+  topn = config["topN_by_class"]
+  pools: Dict[str, List[Dict[str, object]]] = {}
+  for asset_class in ASSET_CLASSES:
+    class_df = df[df["asset_class"] == asset_class]
+    if class_df.empty:
+      pools[asset_class] = []
+      continue
+    limit = int(topn.get(asset_class, 0))
+    selected = class_df.head(limit) if limit > 0 else class_df
+    pools[asset_class] = [
+      {
+        "Code": row["Code"],
+        "Name": row["Name"],
+        "return_6m": float(row["return_6m"]),
+        "risk_pct": float(row["risk_pct"]),
+        "asset_class": asset_class,
+      }
+      for _, row in selected.iterrows()
+    ]
+  return pools
+
+
+def _sample_holding(rng: random.Random, pool: List[Dict[str, object]], used: set[str]) -> Dict[str, object] | None:
+  if not pool:
+    return None
+  candidates = [item for item in pool if item["Code"] not in used]
+  if not candidates:
+    return None
+  idx = rng.randrange(len(candidates))
+  return candidates[idx]
+
+
+def _sample_portfolio_holdings(
+  rng: random.Random,
+  pools: Dict[str, List[Dict[str, object]]],
+  max_holdings: int,
+) -> List[Dict[str, object]] | None:
+  holdings: List[Dict[str, object]] = []
+  used: set[str] = set()
+
+  for asset_class in ASSET_CLASSES:
+    picked = _sample_holding(rng, pools.get(asset_class, []), used)
+    if not picked:
+      return None
+    holdings.append(picked)
+    used.add(picked["Code"])
+
+  extra_slots = max_holdings - len(holdings)
+  if extra_slots <= 0:
+    return holdings
+
+  equity_bias = 0.7
+  for _ in range(extra_slots):
+    if rng.random() < equity_bias:
+      first, second = "Equity", "Alt"
+    else:
+      first, second = "Alt", "Equity"
+    picked = _sample_holding(rng, pools.get(first, []), used)
+    if not picked:
+      picked = _sample_holding(rng, pools.get(second, []), used)
+    if not picked:
+      break
+    holdings.append(picked)
+    used.add(picked["Code"])
+
+  return holdings
+
+
+def _compute_portfolio_metrics(
+  holdings: List[Dict[str, object]],
+  weights: Dict[str, int],
+) -> Tuple[float, float, List[Dict[str, object]]]:
+  total_return = 0.0
+  total_risk = 0.0
+  output_holdings = []
+  for holding in holdings:
+    code = holding["Code"]
+    weight = weights.get(code, 0)
+    if weight <= 0:
+      continue
+    total_return += (weight / 100) * float(holding["return_6m"])
+    total_risk += (weight / 100) * float(holding["risk_pct"])
+    output_holdings.append({
+      "Code": holding["Code"],
+      "Name": holding["Name"],
+      "weight": weight,
+      "asset_class": holding["asset_class"],
+      "risk_pct": float(holding["risk_pct"]),
+      "return_6m": float(holding["return_6m"]),
+    })
+  output_holdings = sorted(output_holdings, key=lambda h: (-h["weight"], h["Code"]))
+  return total_return, total_risk, output_holdings
+
+
+def _tune_weights_to_target(
+  holdings: List[Dict[str, object]],
+  weights: Dict[str, int],
+  bucket: Dict[str, object],
+  max_iters: int = 20,
+  max_moves: int = 40,
+  max_moves_per_iter: int = 6,
+) -> Tuple[Dict[str, int], float, bool, int, int]:
+  min_w = int(CONFIG["portfolio_min_weight"])
+  max_w = int(CONFIG["portfolio_max_weight"])
+  step = int(CONFIG["portfolio_weight_step"])
+  holding_map = {h["Code"]: h for h in holdings}
+  moves = 0
+  lo = float(bucket["min"]) if bucket.get("min") is not None else 0.0
+  hi = bucket.get("max")
+  hi_value = float(hi) if hi is not None else None
+
+  def portfolio_risk() -> float:
+    total = 0.0
+    for code, weight in weights.items():
+      total += (weight / 100) * float(holding_map[code]["risk_pct"])
+    return total
+
+  def select_pair(
+    receiver_pool: List[Dict[str, object]],
+    donor_pool: List[Dict[str, object]],
+  ) -> Tuple[str, str] | None:
+    for receiver in receiver_pool:
+      receiver_code = receiver["Code"]
+      if weights.get(receiver_code, 0) + step > max_w:
+        continue
+      for donor in donor_pool:
+        donor_code = donor["Code"]
+        if weights.get(donor_code, 0) - step < min_w:
+          continue
+        return receiver_code, donor_code
+    return None
+
+  tune_iters = 0
+  for iteration in range(1, max_iters + 1):
+    tune_iters = iteration
+    moved_this_iter = False
+    for _ in range(max_moves_per_iter):
+      if moves >= max_moves:
+        break
+      current_risk = portfolio_risk()
+      within_bucket = _risk_in_bucket(current_risk, bucket)
+      if within_bucket:
+        return weights, current_risk, True, tune_iters, moves
+
+      if hi_value is None:
+        should_lower = False
+        should_raise = current_risk < lo
+      else:
+        should_raise = current_risk < lo
+        should_lower = current_risk >= hi_value
+
+      if should_raise:
+        receiver_pool = [
+          h for h in holdings
+          if h["asset_class"] in ("Equity", "Alt") and weights.get(h["Code"], 0) <= (max_w - step)
+        ]
+        receiver_pool = sorted(
+          receiver_pool,
+          key=lambda h: (-h["risk_pct"], -h["return_6m"], h["Code"]),
+        )
+        donor_pool = [
+          h for h in holdings
+          if h["asset_class"] in ("CashLike", "Bond") and weights.get(h["Code"], 0) >= (min_w + step)
+        ]
+        donor_pool = sorted(
+          donor_pool,
+          key=lambda h: (h["risk_pct"], h["return_6m"], h["Code"]),
+        )
+      elif should_lower:
+        receiver_pool = [
+          h for h in holdings
+          if h["asset_class"] in ("CashLike", "Bond") and weights.get(h["Code"], 0) <= (max_w - step)
+        ]
+        receiver_pool = sorted(
+          receiver_pool,
+          key=lambda h: (h["risk_pct"], -h["return_6m"], h["Code"]),
+        )
+        donor_pool = [
+          h for h in holdings
+          if h["asset_class"] in ("Equity", "Alt") and weights.get(h["Code"], 0) >= (min_w + step)
+        ]
+        donor_pool = sorted(
+          donor_pool,
+          key=lambda h: (-h["risk_pct"], h["return_6m"], h["Code"]),
+        )
+      else:
+        return weights, current_risk, True, tune_iters, moves
+
+      pair = select_pair(receiver_pool, donor_pool)
+      if not pair:
+        break
+      receiver_code, donor_code = pair
+      weights[receiver_code] += step
+      weights[donor_code] -= step
+      moves += 1
+      moved_this_iter = True
+
+    if not moved_this_iter:
+      break
+
+  final_risk = portfolio_risk()
+  return weights, final_risk, _risk_in_bucket(final_risk, bucket), tune_iters, moves
+
+
+def _generate_portfolios_sampled(
+  metrics: pd.DataFrame,
+  config: Dict[str, object],
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+  meta = {
+    "version": PORTFOLIO_VERSION,
+    "sample_count": int(config["sample_count"]),
+    "topN_by_class": config["topN_by_class"],
+    "seed_salt": PORTFOLIO_SEED_SALT,
+  }
+  pools = _build_candidate_pools(metrics, config)
+  if not pools or any(len(pools.get(cls, [])) == 0 for cls in ASSET_CLASSES):
+    items = []
+    for bucket in _bucket_bounds():
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "insufficient_candidates",
+        "meta": {
+          "target_risk": None,
+          "within_bucket": False,
+          "chosen_risk": None,
+          "distance_to_target": None,
+          "tune_iters": 0,
+          "moves": 0,
+          "lo": bucket["min"],
+          "hi": bucket["max"],
+        },
+      })
+    return items, meta
+
+  target_risk_map = {
+    "0-3%": 1.5,
+    "3-6%": 4.5,
+    "6-9%": 7.5,
+    "9-12%": 10.5,
+    "12-15%": 13.5,
+    "15%+": 15.6,
+  }
+
+  items: List[Dict[str, object]] = []
+  sample_count = int(config["sample_count"])
+  max_holdings = int(CONFIG["portfolio_max_holdings"])
+  for bucket in _bucket_bounds():
+    target_risk = float(target_risk_map.get(bucket["label"], _bucket_target(bucket)))
+    seed_source = f"{PORTFOLIO_SEED_SALT}|{bucket['label']}"
+    seed_int = int(hashlib.md5(seed_source.encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed_int)
+    candidates: List[Dict[str, object]] = []
+    for _ in range(sample_count):
+      holdings = _sample_portfolio_holdings(rng, pools, max_holdings)
+      if not holdings:
+        continue
+      weights = _allocate_portfolio_weights(holdings, bucket["label"])
+      weights, tuned_risk, within_bucket, tune_iters, moves = _tune_weights_to_target(
+        holdings,
+        weights,
+        bucket,
+      )
+      total_weight = sum(weights.values())
+      if total_weight != 100:
+        continue
+      total_return, total_risk, output_holdings = _compute_portfolio_metrics(holdings, weights)
+      candidates.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": total_risk,
+        "return_6m": total_return,
+        "holdings": output_holdings,
+        "meta": {
+          "target_risk": target_risk,
+          "within_bucket": within_bucket,
+          "chosen_risk": total_risk,
+          "distance_to_target": abs(total_risk - target_risk) if total_risk is not None else None,
+          "tune_iters": tune_iters,
+          "moves": moves,
+          "lo": bucket["min"],
+          "hi": bucket["max"],
+        },
+      })
+
+    if not candidates:
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "no_candidates",
+      })
+      continue
+
+    in_bucket = [c for c in candidates if _risk_in_bucket(c["risk_pct"], bucket)]
+    if in_bucket:
+      best = max(in_bucket, key=lambda c: (c["return_6m"], -c["risk_pct"]))
+      items.append(best)
+      continue
+
+    best = min(
+      candidates,
+      key=lambda c: (abs(c["risk_pct"] - target_risk), -c["return_6m"]),
+    )
+    best["error"] = "bucket_fallback"
+    if "meta" not in best:
+      best["meta"] = {
+        "target_risk": target_risk,
+        "within_bucket": False,
+        "chosen_risk": best.get("risk_pct"),
+      }
+    best["meta"]["within_bucket"] = False
+    best["meta"]["chosen_risk"] = best.get("risk_pct")
+    if best.get("risk_pct") is not None:
+      best["meta"]["distance_to_target"] = abs(best.get("risk_pct") - target_risk)
+    else:
+      best["meta"]["distance_to_target"] = None
+    if "tune_iters" not in best["meta"]:
+      best["meta"]["tune_iters"] = 0
+    if "moves" not in best["meta"]:
+      best["meta"]["moves"] = 0
+    best["meta"]["lo"] = bucket["min"]
+    best["meta"]["hi"] = bucket["max"]
+    items.append(best)
+
+  return items, meta
+
+
+def _generate_portfolios_grid(
+  metrics: pd.DataFrame,
+  config: Dict[str, object],
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+  meta = {
+    "version": "grid-stub",
+  }
+  items = []
+  for bucket in _bucket_bounds():
+    items.append({
+      "risk_bucket": bucket["label"],
+      "risk_pct": None,
+      "return_6m": None,
+      "holdings": [],
+      "error": "strategy_not_implemented",
+    })
+  return items, meta
+
+
+def _generate_portfolios_bucket_fallback(
+  metrics: pd.DataFrame,
+  config: Dict[str, object],
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+  meta = {
+    "version": "bucket-fallback-stub",
+  }
+  items = []
+  for bucket in _bucket_bounds():
+    items.append({
+      "risk_bucket": bucket["label"],
+      "risk_pct": None,
+      "return_6m": None,
+      "holdings": [],
+      "error": "strategy_not_implemented",
+    })
+  return items, meta
+
+
+def generate_portfolios(
+  items: pd.DataFrame | List[Dict[str, object]],
+  strategy: str = "sampled",
+  config: Dict[str, object] | None = None,
+) -> Dict[str, object]:
+  if isinstance(items, list):
+    metrics = pd.DataFrame.from_records(items)
+  else:
+    metrics = items.copy()
+
+  default_config = {
+    "sample_count": 500,
+    "topN_by_class": {
+      "Equity": 25,
+      "Alt": 20,
+      "Bond": 20,
+      "CashLike": 10,
+    },
+  }
+  if config:
+    default_config.update(config)
+
+  if metrics.empty:
+    empty_items = []
+    for bucket in _bucket_bounds():
+      empty_items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "no_data",
+      })
+    return format_portfolios(empty_items, strategy, {"version": "empty"})
+
+  if strategy == "sampled":
+    items, meta = _generate_portfolios_sampled(metrics, default_config)
+  elif strategy == "grid":
+    items, meta = _generate_portfolios_grid(metrics, default_config)
+  elif strategy == "bucket_fallback":
+    items, meta = _generate_portfolios_bucket_fallback(metrics, default_config)
+  else:
+    items, meta = _generate_portfolios_sampled(metrics, default_config)
+    meta["strategy_warning"] = "unknown_strategy"
+
+  return format_portfolios(items, strategy, meta)
+
+
+def format_portfolios(
+  items: List[Dict[str, object]],
+  strategy: str,
+  meta: Dict[str, object] | None = None,
+) -> Dict[str, object]:
+  payload = {
+    "count": len(items),
+    "items": items,
+    "strategy": strategy,
+  }
+  if meta is not None:
+    payload["meta"] = meta
+  return payload
+
+
+def get_portfolios(strategy: str = "sampled") -> Dict[str, object]:
+  _get_cache()
+  metrics = _CACHE["metrics"]
+  if metrics is None:
+    metrics = pd.DataFrame()
+  return generate_portfolios(metrics, strategy=strategy)
+
+
+def get_price_series(code: str, days: int = 120) -> Dict[str, object]:
+  name = None
+  try:
+    etf_df = load_etf_list()
+    matched = etf_df[etf_df["Code"] == code]
+    if not matched.empty:
+      name = str(matched.iloc[0]["Name"])
+  except Exception:
+    name = None
+  items = load_recent_prices(code, days)
+  return {
+    "code": code,
+    "name": name,
+    "days": days,
+    "items": items,
+  }
+
+
+if __name__ == "__main__":
+  _refresh_cache_from_db()
+  print("scatter rows:", len(get_scatter_data()))
+  print("recommendations:", len(get_recommendations()))
+  print("delta3m rows:", len(get_delta3m()))

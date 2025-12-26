@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Local artifacts
+*.tmp
+*.bak
+
+# Data (선택: 원하면 data 폴더는 트래킹하고, 큰 산출물만 제외)
+data/*.csv
+data/*.parquet
+data/*.xlsx
+data/*.sqlite
+data/*.db
+
+# If you want to keep a sample DB tracked, remove the sqlite/db rules above.
