@@ -1,10 +1,15 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 import engine
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static", static_url_path="/static")
 CORS(app)
+
+
+@app.get("/")
+def index():
+  return send_from_directory(app.static_folder, "index2.html")
 
 
 @app.get("/api/health")

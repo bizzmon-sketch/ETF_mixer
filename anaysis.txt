@@ -1,0 +1,103 @@
+import scipy.optimize as sco
+import pandas as pd
+import numpy as np
+
+# 5일 간격으로 종가 데이터를 정리
+close_pivot = final_df.pivot(index='Date', columns='Code', values='Close')
+close_pivot = close_pivot.sort_index()
+close_pivot = close_pivot.iloc[::5]
+
+# 상관관계 행렬 계산
+correlation_matrix = close_pivot.corr()
+
+# 상관관계가 0.9 이상인 종목 쌍 추출
+upper_triangle = correlation_matrix.where(np.triu(np.ones(correlation_matrix.shape), k=1).astype(bool))
+high_corr_pairs = [(col, row) for col in upper_triangle.columns for row in upper_triangle.index if upper_triangle.loc[row, col] >= 0.9]
+
+# 샤프 비율 계산
+returns = close_pivot.pct_change().dropna()
+mean_returns = returns.mean()
+std_devs = returns.std()
+risk_free_rate = 0.04 / 50.4
+sharpe_ratios = (mean_returns - risk_free_rate) / std_devs
+
+# 상관관계가 높은 종목 중 샤프 비율로 선택
+to_remove = set()
+high_corr_names = []
+selected_names = []
+
+for stock1, stock2 in high_corr_pairs:
+    if stock1 not in to_remove and stock2 not in to_remove:
+        name1 = df.loc[df['단축코드'] == stock1, '한글종목명'].iloc[0]
+        name2 = df.loc[df['단축코드'] == stock2, '한글종목명'].iloc[0]
+        high_corr_names.append((name1, name2))
+
+        if sharpe_ratios[stock1] >= sharpe_ratios[stock2]:
+            to_remove.add(stock2)
+            selected_names.append(name1)
+        else:
+            to_remove.add(stock1)
+            selected_names.append(name2)
+
+# 최종 선택된 종목
+final_codes = [code for code in close_pivot.columns if code not in to_remove]
+
+def optimize_portfolio(codes, max_stocks=10, min_weight=0.05):
+    close_pivot_subset = close_pivot[codes]
+    returns = close_pivot_subset.pct_change().dropna()
+    mean_returns = returns.mean()
+    cov_matrix = returns.cov()
+
+    def portfolio_stats(weights):
+        ret = np.sum(mean_returns * weights) * 50.4  # 연간화
+        vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(50.4)
+        sharpe = (ret - 0.04) / vol
+        return -sharpe  # 최소화 문제로 변환
+
+    def cardinality_constraint(weights):
+        return max_stocks - np.sum(weights > min_weight)
+
+    constraints = [
+        {'type': 'ineq', 'fun': lambda x: 1 - np.sum(x)},  # 비중 합 100%
+        {'type': 'ineq', 'fun': cardinality_constraint}  # 최대 종목 수 제한
+    ]
+
+    bounds = tuple((0, 1) for _ in range(len(mean_returns)))
+
+    optimized = sco.minimize(
+        portfolio_stats,
+        x0=np.array([1/len(mean_returns)] * len(mean_returns)),
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints
+    )
+
+    weights = optimized.x
+    port_weights = pd.Series(weights, index=returns.columns)
+    filtered_weights = port_weights[port_weights >= min_weight]
+
+    # Print optimization results
+    filtered_names = df.loc[df['단축코드'].isin(filtered_weights.index), '한글종목명']
+    print(f"\n선정된 포트폴리오 ({len(filtered_weights)} 종목):")
+    for code, weight in filtered_weights.items():
+        name = df.loc[df['단축코드'] == code, '한글종목명'].iloc[0]
+        print(f"{name}: {weight:.2%}")
+
+    return filtered_weights
+
+# After processing correlation and Sharpe ratio filtering:
+filtered_weights = optimize_portfolio(final_codes)
+
+# Calculate portfolio performance metrics
+returns = close_pivot[filtered_weights.index].pct_change().dropna()
+mean_returns = returns.mean()
+cov_matrix = returns.cov()
+
+portfolio_return = np.sum(mean_returns * filtered_weights) * 50.4
+portfolio_volatility = np.sqrt(np.dot(filtered_weights.T, np.dot(cov_matrix, filtered_weights))) * np.sqrt(50.4)
+sharpe_ratio = (portfolio_return - 0.04) / portfolio_volatility
+
+print(f"\n포트폴리오 성과 지표:")
+print(f"기대수익률: {portfolio_return:.2%}")
+print(f"변동성: {portfolio_volatility:.2%}")
+print(f"샤프 비율: {sharpe_ratio:.4f}")

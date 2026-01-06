@@ -1,0 +1,69 @@
+import pandas as pd
+import requests
+from datetime import datetime
+
+# Load the file to examine its content
+file_path = 'data_0210_20241225.csv'
+df = pd.read_csv(file_path, encoding='cp949')
+df.head()
+
+# Filtering based on 운용사 list and 추적배수 '일반'
+운용사_list = ['미래에셋자산운용', '삼성자산운용', '신한자산운용', '엔에이치아문디자산운용','타임폴리오자산운용',
+             '키움투자자산운용', '한국투자신탁운용', '한화자산운용']
+
+filtered_df = df[(df['운용사'].isin(운용사_list)) & (df['추적배수'] == '일반')][['단축코드', '운용사']]
+filtered_df.reset_index(drop=True, inplace=True)
+
+# 단축코드 리스트 준비
+codes = filtered_df['단축코드'].tolist()
+days = 300
+
+# 네이버 금융에서 특정 ETF 시세 데이터를 가져오는 함수
+def fetch_naver_etf_price(code, days):
+    base_url = f'https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count={days}&requestType=0'
+    response = requests.get(base_url)
+
+    if response.status_code != 200: # 여기서 200은 고정 응답값
+        print(f"Failed to fetch data for code: {code}")
+        return pd.DataFrame()
+
+    # XML 데이터를 파싱하여 DataFrame으로 변환
+    from bs4 import BeautifulSoup
+    # XML 파서를 명시적으로 지정
+    soup = BeautifulSoup(response.text, 'lxml-xml')
+    #soup = BeautifulSoup(response.text, 'html.parser')
+    items = soup.find_all('item')
+
+    # 날짜, 시가, 고가, 저가, 종가, 거래량 데이터 추출
+    data = []
+    for item in items:
+        date, open_price, high_price, low_price, close_price, volume = item['data'].split('|')
+        data.append([datetime.strptime(date, '%Y%m%d'), int(open_price), int(high_price),
+                     int(low_price), int(close_price), int(volume)])
+
+    df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+    df['Code'] = code
+    return df
+
+# 모든 단축코드에 대해 데이터 가져오기
+result = []
+for code in codes:
+    print(f"Fetching data for code: {code}")
+    df_price = fetch_naver_etf_price(code,days)
+    if len(df_price) == days:  # 데이터가 정확히 100일인 경우만 추가
+        result.append(df_price)
+    else:
+        print(f"Data for code {code} has {len(df_price)} rows and was excluded.")
+
+# 결과 병합
+if result:
+    final_df = pd.concat(result, ignore_index=True)
+    #final_df.to_csv('/mnt/data/etf_recent_100days.csv', index=False)
+    print("Data collection complete! Filtered results saved.")
+else:
+    print("No data met the required conditions.")
+
+# Count the number of entries for each 'Code' in the dataset
+code_counts = final_df['Code'].value_counts().reset_index()
+code_counts.columns = ['Code', 'Count']
+code_counts
