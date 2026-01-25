@@ -46,7 +46,8 @@ def prices():
 @app.get("/api/portfolios")
 def portfolios():
   strategy = request.args.get("strategy", "sampled")
-  payload = engine.get_portfolios(strategy=strategy)
+  score = request.args.get("score", "sharpe")
+  payload = engine.get_portfolios(strategy=strategy, score=score)
   return jsonify(payload)
 
 

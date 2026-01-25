@@ -20,6 +20,7 @@ CONFIG = {
   "months": 6,
   "min_observations": 90,
   "trading_days_month": 21,
+  "window_days": 120,
   "cache_ttl_sec": 600,
   "refresh_buffer_days": 3,
   "refresh_interval_sec": 600,
@@ -49,6 +50,7 @@ _CACHE: Dict[str, object] = {
   "metrics": None,
   "recommendations": None,
   "delta3m": None,
+  "returns_tail": None,
   "refresh_mode": None,
   "cached_at": None,
   "data_asof": None,
@@ -277,30 +279,59 @@ def classify_risk(risk_pct: float) -> str | None:
   return None
 
 
-def compute_metrics(etf_df: pd.DataFrame, close: pd.DataFrame) -> pd.DataFrame:
+def _compute_returns_tail(close: pd.DataFrame, window_days: int) -> pd.DataFrame:
   if close.empty:
-    return pd.DataFrame(columns=["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"])
+    return pd.DataFrame()
+  returns = close.pct_change().dropna(how="all")
+  if returns.empty:
+    return returns
+  window_days = int(window_days)
+  if window_days > 0:
+    return returns.tail(window_days)
+  return returns
+
+
+def compute_metrics(
+  etf_df: pd.DataFrame,
+  close: pd.DataFrame,
+  returns_tail: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+  if close.empty:
+    return pd.DataFrame(columns=[
+      "Code", "Name", "return_6m", "return_120d", "risk_6m", "risk_pct", "risk_bucket",
+    ])
 
   counts = close.count()
   eligible = counts[counts >= CONFIG["min_observations"]].index.tolist()
   close = close[eligible].dropna(how="all")
   if close.empty:
-    return pd.DataFrame(columns=["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"])
+    return pd.DataFrame(columns=[
+      "Code", "Name", "return_6m", "return_120d", "risk_6m", "risk_pct", "risk_bucket",
+    ])
 
   returns = close.pct_change().dropna(how="all")
+  if returns_tail is None:
+    returns_tail = _compute_returns_tail(close, CONFIG["window_days"])
+  if not returns_tail.empty:
+    returns_tail = returns_tail.reindex(columns=eligible)
   return_6m = (close.iloc[-1] / close.iloc[0]) - 1
+  if returns_tail.empty:
+    return_120d = pd.Series(index=return_6m.index, dtype=float)
+  else:
+    return_120d = (1 + returns_tail).prod() - 1
   vol_month = returns.std() * np.sqrt(CONFIG["trading_days_month"])
   risk_pct = vol_month * 100
 
   metrics = pd.DataFrame({
     "Code": return_6m.index,
     "return_6m": return_6m.values,
+    "return_120d": return_120d.values,
     "risk_6m": vol_month.values,
     "risk_pct": risk_pct.values,
   })
   metrics["risk_bucket"] = metrics["risk_pct"].apply(classify_risk)
   metrics = metrics.merge(etf_df, on="Code", how="left")
-  metrics = metrics[["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"]]
+  metrics = metrics[["Code", "Name", "return_6m", "return_120d", "risk_6m", "risk_pct", "risk_bucket"]]
   return metrics
 
 
@@ -615,7 +646,8 @@ def _refresh_cache_from_db() -> None:
   start = end - pd.DateOffset(months=CONFIG["months"])
   close = load_close_prices(codes, start, end)
 
-  metrics = compute_metrics(etf_df, close)
+  returns_tail = _compute_returns_tail(close, CONFIG["window_days"])
+  metrics = compute_metrics(etf_df, close, returns_tail=returns_tail)
   recommendations = select_best_by_bucket(metrics)
   delta3m = compute_delta3m(close)
 
@@ -626,6 +658,7 @@ def _refresh_cache_from_db() -> None:
   _CACHE["metrics"] = metrics
   _CACHE["recommendations"] = recommendations
   _CACHE["delta3m"] = delta3m
+  _CACHE["returns_tail"] = returns_tail
 
 
 def _get_cache() -> None:
@@ -832,6 +865,35 @@ def _compute_portfolio_metrics(
   return total_return, total_risk, output_holdings
 
 
+def _compute_portfolio_120d_metrics(
+  holdings: List[Dict[str, object]],
+  weights: Dict[str, int],
+  returns_tail: pd.DataFrame | None,
+) -> Tuple[float | None, float | None]:
+  if returns_tail is None or returns_tail.empty:
+    return None, None
+  codes = [
+    h["Code"] for h in holdings
+    if weights.get(h["Code"], 0) > 0 and h["Code"] in returns_tail.columns
+  ]
+  if not codes:
+    return None, None
+  returns_slice = returns_tail[codes].dropna(how="any")
+  if returns_slice.empty:
+    return None, None
+  weight_values = np.array([weights[code] / 100 for code in codes], dtype=float)
+  rp = returns_slice.mul(weight_values, axis=1).sum(axis=1)
+  if rp.empty:
+    return None, None
+  return_120d = (1 + rp).prod() - 1
+  std = rp.std()
+  if std is None or np.isnan(std) or std == 0:
+    sharpe_120d = None
+  else:
+    sharpe_120d = (rp.mean() / std) * np.sqrt(252)
+  return float(return_120d), None if sharpe_120d is None else float(sharpe_120d)
+
+
 def _tune_weights_to_target(
   holdings: List[Dict[str, object]],
   weights: Dict[str, int],
@@ -945,6 +1007,8 @@ def _tune_weights_to_target(
 def _generate_portfolios_sampled(
   metrics: pd.DataFrame,
   config: Dict[str, object],
+  returns_tail: pd.DataFrame | None,
+  score_mode: str,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
   meta = {
     "version": PORTFOLIO_VERSION,
@@ -987,6 +1051,7 @@ def _generate_portfolios_sampled(
   items: List[Dict[str, object]] = []
   sample_count = int(config["sample_count"])
   max_holdings = int(CONFIG["portfolio_max_holdings"])
+  score_mode = (score_mode or "sharpe").lower()
   for bucket in _bucket_bounds():
     target_risk = float(target_risk_map.get(bucket["label"], _bucket_target(bucket)))
     seed_source = f"{PORTFOLIO_SEED_SALT}|{bucket['label']}"
@@ -1007,10 +1072,14 @@ def _generate_portfolios_sampled(
       if total_weight != 100:
         continue
       total_return, total_risk, output_holdings = _compute_portfolio_metrics(holdings, weights)
+      return_120d, sharpe_120d = _compute_portfolio_120d_metrics(holdings, weights, returns_tail)
       candidates.append({
         "risk_bucket": bucket["label"],
         "risk_pct": total_risk,
         "return_6m": total_return,
+        "return_120d": return_120d,
+        "sharpe_120d": sharpe_120d,
+        "score_mode": score_mode,
         "holdings": output_holdings,
         "meta": {
           "target_risk": target_risk,
@@ -1036,7 +1105,19 @@ def _generate_portfolios_sampled(
 
     in_bucket = [c for c in candidates if _risk_in_bucket(c["risk_pct"], bucket)]
     if in_bucket:
-      best = max(in_bucket, key=lambda c: (c["return_6m"], -c["risk_pct"]))
+      if score_mode == "return":
+        def score_value(candidate: Dict[str, object]) -> float:
+          return float(candidate.get("return_120d") or candidate.get("return_6m") or float("-inf"))
+      else:
+        def score_value(candidate: Dict[str, object]) -> float:
+          value = candidate.get("sharpe_120d")
+          if value is None or (isinstance(value, float) and np.isnan(value)):
+            return float("-inf")
+          return float(value)
+      best = max(
+        in_bucket,
+        key=lambda c: (score_value(c), c.get("return_120d") or c.get("return_6m") or 0.0, -c["risk_pct"]),
+      )
       items.append(best)
       continue
 
@@ -1053,6 +1134,7 @@ def _generate_portfolios_sampled(
       }
     best["meta"]["within_bucket"] = False
     best["meta"]["chosen_risk"] = best.get("risk_pct")
+    best["meta"]["error_reason"] = "no_within_candidates"
     if best.get("risk_pct") is not None:
       best["meta"]["distance_to_target"] = abs(best.get("risk_pct") - target_risk)
     else:
@@ -1081,6 +1163,9 @@ def _generate_portfolios_grid(
       "risk_bucket": bucket["label"],
       "risk_pct": None,
       "return_6m": None,
+      "return_120d": None,
+      "sharpe_120d": None,
+      "score_mode": "return",
       "holdings": [],
       "error": "strategy_not_implemented",
     })
@@ -1100,6 +1185,9 @@ def _generate_portfolios_bucket_fallback(
       "risk_bucket": bucket["label"],
       "risk_pct": None,
       "return_6m": None,
+      "return_120d": None,
+      "sharpe_120d": None,
+      "score_mode": "return",
       "holdings": [],
       "error": "strategy_not_implemented",
     })
@@ -1110,6 +1198,8 @@ def generate_portfolios(
   items: pd.DataFrame | List[Dict[str, object]],
   strategy: str = "sampled",
   config: Dict[str, object] | None = None,
+  returns_tail: pd.DataFrame | None = None,
+  score_mode: str = "sharpe",
 ) -> Dict[str, object]:
   if isinstance(items, list):
     metrics = pd.DataFrame.from_records(items)
@@ -1127,6 +1217,9 @@ def generate_portfolios(
   }
   if config:
     default_config.update(config)
+  score_mode = (score_mode or "sharpe").lower()
+  if score_mode not in ("sharpe", "return"):
+    score_mode = "sharpe"
 
   if metrics.empty:
     empty_items = []
@@ -1135,13 +1228,20 @@ def generate_portfolios(
         "risk_bucket": bucket["label"],
         "risk_pct": None,
         "return_6m": None,
+        "return_120d": None,
+        "sharpe_120d": None,
+        "score_mode": score_mode,
         "holdings": [],
         "error": "no_data",
       })
-    return format_portfolios(empty_items, strategy, {"version": "empty"})
+    return format_portfolios(
+      empty_items,
+      strategy,
+      {"version": "empty"},
+    )
 
   if strategy == "sampled":
-    items, meta = _generate_portfolios_sampled(metrics, default_config)
+    items, meta = _generate_portfolios_sampled(metrics, default_config, returns_tail, score_mode)
   elif strategy == "grid":
     items, meta = _generate_portfolios_grid(metrics, default_config)
   elif strategy == "bucket_fallback":
@@ -1150,6 +1250,18 @@ def generate_portfolios(
     items, meta = _generate_portfolios_sampled(metrics, default_config)
     meta["strategy_warning"] = "unknown_strategy"
 
+  units = {
+    "risk_unit": "monthly_vol_pct",
+    "return_6m_unit": "cumulative",
+    "return_120d_unit": "cumulative",
+    "sharpe_120d_unit": "annualized",
+    "window_days": int(CONFIG["window_days"]),
+    "score_mode": score_mode,
+  }
+  if meta is None:
+    meta = {}
+  meta["units"] = units
+  meta["score_mode"] = units["score_mode"]
   return format_portfolios(items, strategy, meta)
 
 
@@ -1168,12 +1280,13 @@ def format_portfolios(
   return payload
 
 
-def get_portfolios(strategy: str = "sampled") -> Dict[str, object]:
+def get_portfolios(strategy: str = "sampled", score: str = "sharpe") -> Dict[str, object]:
   _get_cache()
   metrics = _CACHE["metrics"]
+  returns_tail = _CACHE.get("returns_tail")
   if metrics is None:
     metrics = pd.DataFrame()
-  return generate_portfolios(metrics, strategy=strategy)
+  return generate_portfolios(metrics, strategy=strategy, returns_tail=returns_tail, score_mode=score)
 
 
 def get_price_series(code: str, days: int = 120) -> Dict[str, object]:

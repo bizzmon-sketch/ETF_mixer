@@ -210,8 +210,8 @@
               <hr class="my-3" />
 
               <div class="row g-2">
-                <div class="col-4">
-                  <div class="small-muted">수익률</div>
+            <div class="col-4">
+                  <div class="small-muted" id="metricReturnLabel">수익률</div>
                   <div class="fw-bold" id="metricReturn">-</div>
                 </div>
                 <div class="col-4">
@@ -319,6 +319,11 @@
       return `${(value * 100).toFixed(digits)}%`;
     }
 
+    function fmtPctFromRatioSafe(value, digits = 1) {
+      if (value === null || value === undefined || Number.isNaN(value)) return '-';
+      return fmtPctFromRatio(value, digits);
+    }
+
     function fmtPct(value, digits = 1) {
       return `${Number(value).toFixed(digits)}%`;
     }
@@ -342,6 +347,17 @@
       return `${item.Name} (${item.Code})의 최근 6개월 수익률과 월 변동성 위치를 요약한 포인트입니다.`;
     }
 
+    function getReturnRatio(item) {
+      if (!item) return null;
+      if (item.return_120d !== undefined && item.return_120d !== null) return item.return_120d;
+      return item.return_6m;
+    }
+
+    function getReturnLabel(item) {
+      if (item && item.return_120d !== undefined && item.return_120d !== null) return '120일 수익률';
+      return '6개월 수익률';
+    }
+
     function renderRecommendCards() {
       const container = document.getElementById('bucketTabs');
       container.innerHTML = '';
@@ -349,7 +365,7 @@
       const cards = state.portfolios.map((item) => ({
         title: `${item.risk_bucket || '리스크 미분류'} 포트폴리오`,
         bucket: item.risk_bucket || '',
-        ret: fmtPctFromRatio(item.return_6m, 1),
+        ret: fmtPctFromRatioSafe(getReturnRatio(item), 1),
         vol: fmtPct(item.risk_pct, 2),
       }));
 
@@ -403,9 +419,14 @@
       chip.style.borderRadius = '999px';
       chip.style.display = 'inline-block';
 
-      document.getElementById('metricReturn').textContent = fmtPctFromRatio(item.return_6m, 1);
+      document.getElementById('metricReturnLabel').textContent = getReturnLabel(item);
+      document.getElementById('metricReturn').textContent = fmtPctFromRatioSafe(getReturnRatio(item), 1);
       document.getElementById('metricVol').textContent = fmtPct(item.risk_pct, 2);
-      document.getElementById('metricSharpe').textContent = '-';
+      if (item.sharpe_120d !== undefined && item.sharpe_120d !== null && !Number.isNaN(item.sharpe_120d)) {
+        document.getElementById('metricSharpe').textContent = Number(item.sharpe_120d).toFixed(2);
+      } else {
+        document.getElementById('metricSharpe').textContent = '-';
+      }
 
       const list = document.getElementById('holdingsList');
       list.innerHTML = '';
@@ -453,17 +474,17 @@
 
     function buildPlotTraces() {
       const scatterX = state.scatterItems.map((item) => item.risk_pct);
-      const scatterY = state.scatterItems.map((item) => item.return_6m * 100);
+      const scatterY = state.scatterItems.map((item) => getReturnRatio(item) * 100);
       const scatterHover = state.scatterItems.map((item) => {
-        return `${escapeHtml(item.Name)} <span class="mono">(${escapeHtml(item.Code)})</span><br>수익률: ${fmtPctFromRatio(item.return_6m, 1)}<br>변동성: ${fmtPct(item.risk_pct, 2)}<br>리스크 구간: ${escapeHtml(item.risk_bucket || '-')}`;
+        return `${escapeHtml(item.Name)} <span class="mono">(${escapeHtml(item.Code)})</span><br>${escapeHtml(getReturnLabel(item))}: ${fmtPctFromRatioSafe(getReturnRatio(item), 1)}<br>변동성: ${fmtPct(item.risk_pct, 2)}<br>리스크 구간: ${escapeHtml(item.risk_bucket || '-')}`;
       });
 
       const recX = state.portfolios.map((item) => item.risk_pct);
-      const recY = state.portfolios.map((item) => item.return_6m * 100);
+      const recY = state.portfolios.map((item) => getReturnRatio(item) * 100);
       const recText = state.portfolios.map((item) => item.risk_bucket || '');
       const recHover = state.portfolios.map((item) => {
         return `리스크 구간: ${escapeHtml(item.risk_bucket || '-')}` +
-          `<br>수익률: ${fmtPctFromRatio(item.return_6m, 1)}` +
+          `<br>${escapeHtml(getReturnLabel(item))}: ${fmtPctFromRatioSafe(getReturnRatio(item), 1)}` +
           `<br>변동성: ${fmtPct(item.risk_pct, 2)}`;
       });
 
@@ -502,7 +523,7 @@
             mode: 'markers',
             name: '선택됨',
             x: [item.risk_pct],
-            y: [item.return_6m * 100],
+            y: [getReturnRatio(item) * 100],
             hovertemplate: '<extra></extra>',
             marker: { color: CONFIG.colors.selected, size: 16, symbol: 'circle-open', line: { color: CONFIG.colors.selected, width: 3 } },
           };
@@ -518,7 +539,7 @@
             .map((holding) => {
               const match = state.scatterItems.find((item) => item.Code === holding.Code);
               if (!match) return null;
-              return { ...holding, risk_pct: match.risk_pct, return_6m: match.return_6m };
+              return { ...holding, risk_pct: match.risk_pct, return_ratio: getReturnRatio(match) };
             })
             .filter(Boolean);
 
@@ -526,7 +547,7 @@
           const lineY = [];
           for (const holding of holdingPoints) {
             lineX.push(holding.risk_pct, portfolio.risk_pct, null);
-            lineY.push(holding.return_6m * 100, portfolio.return_6m * 100, null);
+            lineY.push(holding.return_ratio * 100, getReturnRatio(portfolio) * 100, null);
           }
 
           lineTrace = {
@@ -544,7 +565,7 @@
             mode: 'markers',
             name: '포트폴리오 구성',
             x: holdingPoints.map((h) => h.risk_pct),
-            y: holdingPoints.map((h) => h.return_6m * 100),
+            y: holdingPoints.map((h) => h.return_ratio * 100),
             hovertemplate: '<extra></extra>',
             marker: {
               color: '#0d6efd',
@@ -607,6 +628,9 @@
 
     function renderPlot() {
       const traces = buildPlotTraces();
+      const hasReturn120d = state.scatterItems.some((item) => item.return_120d !== undefined && item.return_120d !== null)
+        || state.portfolios.some((item) => item.return_120d !== undefined && item.return_120d !== null);
+      const yTitle = hasReturn120d ? '120일 수익률 (%)' : '6개월 수익률 (%)';
 
       const layout = {
         margin: { l: 60, r: 20, t: 10, b: 60 },
@@ -617,7 +641,7 @@
           zeroline: false,
         },
         yaxis: {
-          title: '6개월 수익률 (%)',
+          title: yTitle,
           gridcolor: 'rgba(0,0,0,0.06)',
           zeroline: false,
         },
@@ -724,7 +748,7 @@
         const errorLabel = portfolio.error ? ` · ${portfolio.error}` : '';
         el.innerHTML = `
           <div class="fw-bold">${escapeHtml(portfolio.risk_bucket || '리스크 미분류')} 포트폴리오${escapeHtml(errorLabel)}</div>
-          <div class="small-muted">수익률 ${fmtPctFromRatio(portfolio.return_6m, 1)} · 변동성 ${fmtPct(portfolio.risk_pct, 2)}</div>
+          <div class="small-muted">${escapeHtml(getReturnLabel(portfolio))} ${fmtPctFromRatioSafe(getReturnRatio(portfolio), 1)} · 변동성 ${fmtPct(portfolio.risk_pct, 2)}</div>
           <div class="small-muted">구성: ${escapeHtml(holdingText)}${escapeHtml(suffix)}</div>
         `;
         return;
@@ -736,7 +760,7 @@
         const assetClass = classifyAssetClass(item.Name);
         el.innerHTML = `
           <div class="fw-bold">${escapeHtml(item.Name)} <span class="mono">(${escapeHtml(item.Code)})</span></div>
-          <div class="small-muted">수익률 ${fmtPctFromRatio(item.return_6m, 1)} · 변동성 ${fmtPct(item.risk_pct, 2)} · ${escapeHtml(item.risk_bucket || '-')} · ${escapeHtml(assetClass)}</div>
+          <div class="small-muted">${escapeHtml(getReturnLabel(item))} ${fmtPctFromRatioSafe(getReturnRatio(item), 1)} · 변동성 ${fmtPct(item.risk_pct, 2)} · ${escapeHtml(item.risk_bucket || '-')} · ${escapeHtml(assetClass)}</div>
         `;
       }
     }
