@@ -298,7 +298,7 @@ def compute_metrics(
 ) -> pd.DataFrame:
   if close.empty:
     return pd.DataFrame(columns=[
-      "Code", "Name", "return_6m", "return_120d", "risk_6m", "risk_pct", "risk_bucket",
+      "Code", "Name", "return_6m", "return_120d", "sharpe_120d", "risk_6m", "risk_pct", "risk_bucket",
     ])
 
   counts = close.count()
@@ -306,7 +306,7 @@ def compute_metrics(
   close = close[eligible].dropna(how="all")
   if close.empty:
     return pd.DataFrame(columns=[
-      "Code", "Name", "return_6m", "return_120d", "risk_6m", "risk_pct", "risk_bucket",
+      "Code", "Name", "return_6m", "return_120d", "sharpe_120d", "risk_6m", "risk_pct", "risk_bucket",
     ])
 
   returns = close.pct_change().dropna(how="all")
@@ -317,8 +317,14 @@ def compute_metrics(
   return_6m = (close.iloc[-1] / close.iloc[0]) - 1
   if returns_tail.empty:
     return_120d = pd.Series(index=return_6m.index, dtype=float)
+    sharpe_120d = pd.Series(index=return_6m.index, dtype=float)
   else:
     return_120d = (1 + returns_tail).prod() - 1
+    returns_mean = returns_tail.mean()
+    returns_std = returns_tail.std()
+    sharpe_120d = (returns_mean / returns_std) * np.sqrt(252)
+    sharpe_120d = sharpe_120d.replace([np.inf, -np.inf], np.nan)
+    sharpe_120d = sharpe_120d.where(returns_std > 0)
   vol_month = returns.std() * np.sqrt(CONFIG["trading_days_month"])
   risk_pct = vol_month * 100
 
@@ -326,12 +332,13 @@ def compute_metrics(
     "Code": return_6m.index,
     "return_6m": return_6m.values,
     "return_120d": return_120d.values,
+    "sharpe_120d": sharpe_120d.values,
     "risk_6m": vol_month.values,
     "risk_pct": risk_pct.values,
   })
   metrics["risk_bucket"] = metrics["risk_pct"].apply(classify_risk)
   metrics = metrics.merge(etf_df, on="Code", how="left")
-  metrics = metrics[["Code", "Name", "return_6m", "return_120d", "risk_6m", "risk_pct", "risk_bucket"]]
+  metrics = metrics[["Code", "Name", "return_6m", "return_120d", "sharpe_120d", "risk_6m", "risk_pct", "risk_bucket"]]
   return metrics
 
 
@@ -771,15 +778,22 @@ def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> 
     return {}
   df["asset_class"] = df["Name"].apply(classify_asset_class)
   df = _sort_candidates(df)
-  topn = config["topN_by_class"]
+  topn_config = config.get("topN_by_class", 20)
+  if isinstance(topn_config, dict):
+    topn = int(topn_config.get("default", 20))
+  else:
+    topn = int(topn_config)
   pools: Dict[str, List[Dict[str, object]]] = {}
   for asset_class in ASSET_CLASSES:
     class_df = df[df["asset_class"] == asset_class]
     if class_df.empty:
       pools[asset_class] = []
       continue
-    limit = int(topn.get(asset_class, 0))
-    selected = class_df.head(limit) if limit > 0 else class_df
+    sharpe_df = class_df.dropna(subset=["sharpe_120d"]).copy()
+    sharpe_df = sharpe_df.sort_values(["sharpe_120d", "return_6m", "risk_pct", "Code"], ascending=[False, False, True, True])
+    selected = sharpe_df.head(topn)
+    if selected.empty:
+      selected = class_df
     pools[asset_class] = [
       {
         "Code": row["Code"],
@@ -1010,13 +1024,23 @@ def _generate_portfolios_sampled(
   returns_tail: pd.DataFrame | None,
   score_mode: str,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+  sample_count_default = int(config["sample_count"])
+  sample_count_overrides = config.get("sample_count_by_bucket") or {}
   meta = {
     "version": PORTFOLIO_VERSION,
-    "sample_count": int(config["sample_count"]),
-    "topN_by_class": config["topN_by_class"],
+    "sample_count": sample_count_default,
+    "sample_count_by_bucket": {
+      "default": sample_count_default,
+      **{key: int(value) for key, value in sample_count_overrides.items()},
+    },
+    "portfolio_size_range": [4, int(CONFIG["portfolio_max_holdings"])],
+    "topN_by_class": 20,
     "seed_salt": PORTFOLIO_SEED_SALT,
+    "universe_mode": "top20_by_asset_class",
+    "window_days": int(CONFIG["window_days"]),
   }
   pools = _build_candidate_pools(metrics, config)
+  meta["universe_counts"] = {key: len(value) for key, value in pools.items()}
   if not pools or any(len(pools.get(cls, [])) == 0 for cls in ASSET_CLASSES):
     items = []
     for bucket in _bucket_bounds():
@@ -1049,17 +1073,24 @@ def _generate_portfolios_sampled(
   }
 
   items: List[Dict[str, object]] = []
-  sample_count = int(config["sample_count"])
   max_holdings = int(CONFIG["portfolio_max_holdings"])
+  min_holdings = 4
+  if max_holdings < min_holdings:
+    max_holdings = min_holdings
   score_mode = (score_mode or "sharpe").lower()
   for bucket in _bucket_bounds():
+    local_sample_count = int(sample_count_overrides.get(bucket["label"], sample_count_default))
     target_risk = float(target_risk_map.get(bucket["label"], _bucket_target(bucket)))
     seed_source = f"{PORTFOLIO_SEED_SALT}|{bucket['label']}"
     seed_int = int(hashlib.md5(seed_source.encode()).hexdigest()[:8], 16)
     rng = random.Random(seed_int)
     candidates: List[Dict[str, object]] = []
-    for _ in range(sample_count):
-      holdings = _sample_portfolio_holdings(rng, pools, max_holdings)
+    for candidate_idx in range(local_sample_count):
+      size_seed = f"{PORTFOLIO_SEED_SALT}|{bucket['label']}|{candidate_idx}|size"
+      size_seed_int = int(hashlib.md5(size_seed.encode()).hexdigest()[:8], 16)
+      size_rng = random.Random(size_seed_int)
+      n_assets = size_rng.randint(min_holdings, max_holdings)
+      holdings = _sample_portfolio_holdings(rng, pools, n_assets)
       if not holdings:
         continue
       weights = _allocate_portfolio_weights(holdings, bucket["label"])
@@ -1208,6 +1239,10 @@ def generate_portfolios(
 
   default_config = {
     "sample_count": 500,
+    "sample_count_by_bucket": {
+      "0-3%": 3000,
+      "3-6%": 3000,
+    },
     "topN_by_class": {
       "Equity": 25,
       "Alt": 20,
