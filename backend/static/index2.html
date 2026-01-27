@@ -135,7 +135,7 @@
     </div>
 
     <div class="row g-3">
-      <div class="col-lg-8">
+      <div class="col-lg-8 order-2 order-lg-1">
         <div class="card">
           <div class="card-header d-flex flex-wrap gap-2 align-items-center justify-content-between">
             <div>
@@ -157,7 +157,7 @@
         </div>
       </div>
 
-      <div class="col-lg-4">
+      <div class="col-lg-4 order-1 order-lg-2">
         <div class="card mb-3">
           <div class="card-header d-flex align-items-center justify-content-between">
             <div class="fw-bold">종목코드 검색</div>
@@ -183,7 +183,9 @@
             <div class="bucket-tabs" id="bucketTabs"></div>
           </div>
         </div>
+      </div>
 
+      <div class="col-12 col-lg-4 order-4 order-lg-3 offset-lg-8">
         <div class="card h-100">
           <div class="card-header d-flex align-items-center justify-content-between">
             <div class="fw-bold">포트폴리오 상세</div>
@@ -246,7 +248,6 @@
             </div>
           </div>
         </div>
-
       </div>
     </div>
 
@@ -296,6 +297,10 @@
         selected: '#111827',
         hover: 'rgba(108,117,125,0.55)',
       },
+      sizes: {
+        etfPoint: 7,
+        holdingMin: 6,
+      },
       riskBuckets: [
         { label: '0-3%', min: 0, max: 3, color: '#2E7D32' },
         { label: '3-6%', min: 3, max: 6, color: '#66BB6A' },
@@ -326,6 +331,20 @@
 
     function fmtPct(value, digits = 1) {
       return `${Number(value).toFixed(digits)}%`;
+    }
+
+    function normalizeWeight(value) {
+      const num = Number(value);
+      if (Number.isNaN(num)) return 0;
+      const normalized = num > 1 ? num / 100 : num;
+      return Math.max(0, Math.min(1, normalized));
+    }
+
+    function scaleHoldingSize(weight) {
+      const minSize = CONFIG.sizes.holdingMin;
+      const maxSize = CONFIG.sizes.etfPoint;
+      const ratio = normalizeWeight(weight);
+      return minSize + (maxSize - minSize) * ratio;
     }
 
     function setLastUpdated() {
@@ -496,7 +515,7 @@
         y: scatterY,
         text: scatterHover,
         hovertemplate: '<extra></extra>',
-        marker: { color: CONFIG.colors.points, size: 7 },
+        marker: { color: CONFIG.colors.points, size: CONFIG.sizes.etfPoint },
         customdata: state.scatterItems.map((item) => ({ type: 'etf', code: item.Code })),
       };
 
@@ -557,7 +576,7 @@
             x: lineX,
             y: lineY,
             hovertemplate: '<extra></extra>',
-            line: { color: 'rgba(13,110,253,0.35)', width: 2 },
+            line: { color: 'rgba(140,140,140,0.25)', width: 2 },
           };
 
           holdingsTrace = {
@@ -568,9 +587,9 @@
             y: holdingPoints.map((h) => h.return_ratio * 100),
             hovertemplate: '<extra></extra>',
             marker: {
-              color: '#0d6efd',
-              size: 12,
-              line: { color: '#0b5ed7', width: 2 },
+              color: '#7bd389',
+              size: holdingPoints.map((h) => scaleHoldingSize(h.weight)),
+              line: { color: 'rgba(82,130,92,0.6)', width: 1.5 },
             },
           };
         }
