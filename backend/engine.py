@@ -1238,11 +1238,8 @@ def generate_portfolios(
     metrics = items.copy()
 
   default_config = {
-    "sample_count": 500,
-    "sample_count_by_bucket": {
-      "0-3%": 3000,
-      "3-6%": 3000,
-    },
+    "sample_count": 1000,
+    "sample_count_by_bucket": {},
     "topN_by_class": {
       "Equity": 25,
       "Alt": 20,

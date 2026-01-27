@@ -183,6 +183,27 @@
             <div class="bucket-tabs" id="bucketTabs"></div>
           </div>
         </div>
+
+        <div class="card mb-3">
+          <div class="card-header d-flex align-items-center justify-content-between">
+            <div class="fw-bold">포트 저장</div>
+            <span class="tag tag-demo">DEMO</span>
+          </div>
+          <div class="card-body">
+            <div class="mb-2">
+              <label class="form-label small-muted" for="savePortfolioName">포트 이름</label>
+              <input class="form-control form-control-sm" type="text" id="savePortfolioName" placeholder="예: 연금-안정형" />
+            </div>
+            <div class="mb-2">
+              <label class="form-label small-muted" for="savePortfolioBudget">초기 투자금 (원)</label>
+              <input class="form-control form-control-sm" type="number" id="savePortfolioBudget" placeholder="예: 10000000" />
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <button class="btn btn-soft btn-sm" id="btnSavePortfolio" type="button">현재 포트 저장</button>
+              <div class="small-muted" id="savePortfolioMsg">추천 포트를 선택한 뒤 저장하세요.</div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="col-12 col-lg-4 order-4 order-lg-3 offset-lg-8">
@@ -290,6 +311,7 @@
         scatter: '/api/scatter',
         portfolios: '/api/portfolios',
         prices: '/api/prices',
+        savedPortfolios: '/api/portfolios/saved',
       },
       colors: {
         points: 'rgba(108,117,125,0.45)',
@@ -790,6 +812,20 @@
       return res.json();
     }
 
+    async function postJson(url, payload) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {}),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const message = data.error || `Request failed: ${res.status}`;
+        throw new Error(message);
+      }
+      return res.json();
+    }
+
     async function refreshFromBackend() {
       const [scatter, portfolios] = await Promise.all([
         fetchJson(CONFIG.api.scatter),
@@ -811,6 +847,7 @@
     function wireUI() {
       document.getElementById('btnResetSelection').addEventListener('click', clearSelection);
       document.getElementById('btnFindCode').addEventListener('click', handleSearch);
+      document.getElementById('btnSavePortfolio').addEventListener('click', handleSavePortfolio);
       document.getElementById('codeInput').addEventListener('keydown', (ev) => {
         if (ev.key === 'Enter') {
           handleSearch();
@@ -879,6 +916,49 @@
       const input = document.getElementById('codeInput');
       if (!input) return;
       selectEtfByCode(input.value);
+    }
+
+    function getSelectedPortfolioAllocations() {
+      if (!state.selectedPortfolioBucket) return null;
+      const portfolio = state.portfolios.find((item) => item.risk_bucket === state.selectedPortfolioBucket);
+      if (!portfolio || !Array.isArray(portfolio.holdings) || portfolio.holdings.length === 0) {
+        return null;
+      }
+      return portfolio.holdings.map((holding) => ({
+        code: holding.Code,
+        name: holding.Name,
+        asset_class: holding.asset_class || classifyAssetClass(holding.Name),
+        target_weight_pct: Number(holding.weight),
+      }));
+    }
+
+    async function handleSavePortfolio() {
+      const nameInput = document.getElementById('savePortfolioName');
+      const budgetInput = document.getElementById('savePortfolioBudget');
+      const msg = document.getElementById('savePortfolioMsg');
+      if (!nameInput || !budgetInput || !msg) return;
+      const name = nameInput.value.trim();
+      if (!name) {
+        msg.textContent = '포트 이름을 입력하세요.';
+        return;
+      }
+      const targets = getSelectedPortfolioAllocations();
+      if (!targets) {
+        msg.textContent = '추천 포트를 먼저 선택하세요.';
+        return;
+      }
+      const budget = Number(budgetInput.value || 0);
+      msg.textContent = '저장 중...';
+      try {
+        await postJson(CONFIG.api.savedPortfolios, {
+          name,
+          initial_budget_krw: Math.max(0, Math.floor(budget)),
+          target_allocations: targets,
+        });
+        msg.textContent = '저장 완료!';
+      } catch (err) {
+        msg.textContent = `저장 실패: ${err.message}`;
+      }
     }
 
     function updateBucketTabActive() {
