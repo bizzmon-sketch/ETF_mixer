@@ -26,3 +26,5 @@ data/*.sqlite
 data/*.db
 
 # If you want to keep a sample DB tracked, remove the sqlite/db rules above.
+
+!data/etf_list.csv
