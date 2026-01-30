@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>연금 ETF 포트폴리오 최적화 (Demo) FROM BACKEND/STATIC</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
   <style>
     :root {
       --bg: #f6f7fb;
@@ -598,77 +598,77 @@
     }
 
     function buildPlotTraces() {
-      const scatterX = state.scatterItems.map((item) => item.risk_pct);
-      const scatterY = state.scatterItems.map((item) => getReturnRatio(item) * 100);
-      const scatterHover = state.scatterItems.map((item) => {
-        return `${escapeHtml(item.Name)} <span class="mono">(${escapeHtml(item.Code)})</span><br>${escapeHtml(getReturnLabel(item))}: ${fmtPctFromRatioSafe(getReturnRatio(item), 1)}<br>변동성: ${fmtPct(item.risk_pct, 2)}<br>리스크 구간: ${escapeHtml(item.risk_bucket || '-')}`;
-      });
-
-      const recX = state.portfolios.map((item) => item.risk_pct);
-      const recY = state.portfolios.map((item) => getReturnRatio(item) * 100);
-      const recText = state.portfolios.map((item) => item.risk_bucket || '');
-      const recHover = state.portfolios.map((item) => {
-        return `리스크 구간: ${escapeHtml(item.risk_bucket || '-')}` +
-          `<br>${escapeHtml(getReturnLabel(item))}: ${fmtPctFromRatioSafe(getReturnRatio(item), 1)}` +
-          `<br>변동성: ${fmtPct(item.risk_pct, 2)}`;
-      });
-
-      const scatterTrace = {
-        type: 'scattergl',
-        mode: 'markers',
-        name: 'ETF',
-        x: scatterX,
-        y: scatterY,
-        text: scatterHover,
-        hovertemplate: '<extra></extra>',
-        marker: { color: CONFIG.colors.points, size: CONFIG.sizes.etfPoint },
-        customdata: state.scatterItems.map((item) => ({ type: 'etf', code: item.Code })),
-      };
+      const scatterData = state.scatterItems.map((item) => ({
+        value: [item.risk_pct, getReturnRatio(item) * 100],
+        name: `${item.Name} (${item.Code})`,
+        meta: { type: 'etf', code: item.Code },
+      }));
 
       const hasSelectedPortfolio = Boolean(state.selectedPortfolioBucket);
-      const recColors = state.portfolios.map((item) => {
-        if (!hasSelectedPortfolio) return CONFIG.colors.recommendations;
-        if (item.risk_bucket === state.selectedPortfolioBucket) return CONFIG.colors.recommendations;
-        return 'rgba(13,110,253,0.22)';
-      });
       const recSizes = state.portfolios.map((item) => {
         if (!hasSelectedPortfolio) return isMobile ? 22 : 14;
         if (item.risk_bucket === state.selectedPortfolioBucket) return isMobile ? 22 : 14;
         return isMobile ? 14 : 9;
       });
 
-      const recommendationTrace = {
-        type: 'scatter',
-        mode: 'markers+text',
-        name: '리스크 구간 포트폴리오',
-        x: recX,
-        y: recY,
-        text: recText,
-        textposition: 'top center',
-        hovertemplate: '<extra></extra>',
-        textfont: { size: isMobile ? 14 : 12, color: '#0d6efd' },
-        marker: { color: recColors, size: recSizes, symbol: 'star', line: { color: '#0b5ed7', width: isMobile ? 3 : 2 } },
-        customdata: state.portfolios.map((item) => ({ type: 'portfolio', bucket: item.risk_bucket })),
-      };
+      const recommendationData = state.portfolios.map((item, idx) => ({
+        value: [item.risk_pct, getReturnRatio(item) * 100],
+        name: item.risk_bucket || '',
+        symbolSize: recSizes[idx],
+        itemStyle: {
+          color: (!hasSelectedPortfolio || item.risk_bucket === state.selectedPortfolioBucket)
+            ? CONFIG.colors.recommendations
+            : 'rgba(13,110,253,0.22)',
+          borderColor: '#0b5ed7',
+          borderWidth: isMobile ? 3 : 2,
+        },
+        meta: { type: 'portfolio', bucket: item.risk_bucket },
+      }));
 
-      let selectedTrace = null;
+      const series = [
+        {
+          name: 'ETF',
+          type: 'scatter',
+          data: scatterData,
+          symbolSize: CONFIG.sizes.etfPoint,
+          itemStyle: { color: CONFIG.colors.points },
+          clip: true,
+        },
+        {
+          name: '리스크 구간 포트폴리오',
+          type: 'scatter',
+          symbol: 'star',
+          data: recommendationData,
+          label: {
+            show: true,
+            position: 'top',
+            color: '#0d6efd',
+            fontSize: isMobile ? 14 : 12,
+            formatter: '{b}',
+          },
+          clip: false,
+        },
+      ];
+
       if (state.selectedCode) {
         const item = state.scatterItems.find((x) => x.Code === state.selectedCode);
         if (item) {
-          selectedTrace = {
-            type: 'scatter',
-            mode: 'markers',
+          series.push({
             name: '선택됨',
-            x: [item.risk_pct],
-            y: [getReturnRatio(item) * 100],
-            hovertemplate: '<extra></extra>',
-            marker: { color: CONFIG.colors.selected, size: 16, symbol: 'circle-open', line: { color: CONFIG.colors.selected, width: 3 } },
-          };
+            type: 'scatter',
+            data: [{
+              value: [item.risk_pct, getReturnRatio(item) * 100],
+              meta: { type: 'selected', code: item.Code },
+            }],
+            symbol: 'circle',
+            symbolSize: 16,
+            itemStyle: { color: 'rgba(0,0,0,0)', borderColor: CONFIG.colors.selected, borderWidth: 3 },
+            z: 5,
+            clip: false,
+          });
         }
       }
 
-      let holdingsTrace = null;
-      let lineTrace = null;
       if (state.selectedPortfolioBucket) {
         const portfolio = state.portfolios.find((x) => x.risk_bucket === state.selectedPortfolioBucket);
         if (portfolio && Array.isArray(portfolio.holdings)) {
@@ -680,64 +680,40 @@
             })
             .filter(Boolean);
 
-          const lineX = [];
-          const lineY = [];
+          const lineData = [];
           for (const holding of holdingPoints) {
-            lineX.push(holding.risk_pct, portfolio.risk_pct, null);
-            lineY.push(holding.return_ratio * 100, getReturnRatio(portfolio) * 100, null);
+            lineData.push([holding.risk_pct, holding.return_ratio * 100]);
+            lineData.push([portfolio.risk_pct, getReturnRatio(portfolio) * 100]);
+            lineData.push([null, null]);
           }
 
-          lineTrace = {
-            type: 'scatter',
-            mode: 'lines',
+          series.push({
             name: '조합 연결선',
-            x: lineX,
-            y: lineY,
-            hovertemplate: '<extra></extra>',
-            line: { color: 'rgba(140,140,140,0.25)', width: 2 },
-          };
+            type: 'line',
+            data: lineData,
+            lineStyle: { color: 'rgba(140,140,140,0.25)', width: 2 },
+            symbol: 'none',
+            connectNulls: false,
+            z: 1,
+            clip: true,
+          });
 
-          holdingsTrace = {
-            type: 'scatter',
-            mode: 'markers',
+          series.push({
             name: '포트폴리오 구성',
-            x: holdingPoints.map((h) => h.risk_pct),
-            y: holdingPoints.map((h) => h.return_ratio * 100),
-            hovertemplate: '<extra></extra>',
-            marker: {
-              color: '#7bd389',
-              size: holdingPoints.map((h) => scaleHoldingSize(h.weight)),
-              line: { color: 'rgba(82,130,92,0.6)', width: 1.5 },
-            },
-          };
+            type: 'scatter',
+            data: holdingPoints.map((h) => ({
+              value: [h.risk_pct, h.return_ratio * 100],
+              symbolSize: scaleHoldingSize(h.weight),
+              meta: { type: 'etf', code: h.Code },
+            })),
+            itemStyle: { color: '#7bd389', borderColor: 'rgba(82,130,92,0.6)', borderWidth: 1.5 },
+            clip: true,
+            z: 3,
+          });
         }
       }
 
-      let hoverTrace = null;
-      if (state.hoverPoint) {
-        const isPortfolio = state.hoverPoint.type === 'portfolio';
-        hoverTrace = {
-          type: 'scatter',
-          mode: 'markers',
-          name: 'Hover',
-          x: [state.hoverPoint.x],
-          y: [state.hoverPoint.y],
-          hovertemplate: '<extra></extra>',
-          marker: {
-            color: 'rgba(255,255,255,0.6)',
-            size: isPortfolio ? 20 : 14,
-            symbol: isPortfolio ? 'circle-open' : 'circle-open',
-            line: { color: CONFIG.colors.hover, width: isPortfolio ? 3 : 2 },
-          },
-        };
-      }
-
-      const traces = [scatterTrace, recommendationTrace];
-      if (lineTrace) traces.push(lineTrace);
-      if (holdingsTrace) traces.push(holdingsTrace);
-      if (selectedTrace) traces.push(selectedTrace);
-      if (hoverTrace) traces.push(hoverTrace);
-      return traces;
+      return series;
     }
 
     function buildRiskBandShapes() {
@@ -764,109 +740,108 @@
     }
 
     function renderPlot() {
-      const traces = buildPlotTraces();
+      const series = buildPlotTraces();
       const hasReturn120d = state.scatterItems.some((item) => item.return_120d !== undefined && item.return_120d !== null)
         || state.portfolios.some((item) => item.return_120d !== undefined && item.return_120d !== null);
       const yTitle = hasReturn120d ? '120일 수익률 (%)' : '6개월 수익률 (%)';
-
-      const layout = {
-        margin: { l: 60, r: 20, t: 10, b: 60 },
-        dragmode: 'pan',
-        clickmode: 'event+select',
-        xaxis: {
-          title: '월 변동성 (%)',
-          range: [0, 16],
-          gridcolor: 'rgba(0,0,0,0.06)',
-          zeroline: false,
-          fixedrange: false,
-        },
-        yaxis: {
-          title: yTitle,
-          gridcolor: 'rgba(0,0,0,0.06)',
-          zeroline: false,
-          fixedrange: false,
-        },
-        hovermode: 'closest',
-        hoverlabel: {
-          bgcolor: 'rgba(0,0,0,0)',
-          bordercolor: 'rgba(0,0,0,0)',
-          font: { color: 'rgba(0,0,0,0)' },
-        },
-        paper_bgcolor: 'rgba(0,0,0,0)',
-        plot_bgcolor: '#ffffff',
-        legend: { orientation: 'h', y: -0.22 },
-        shapes: buildRiskBandShapes(),
-        annotations: [
-          {
-            xref: 'paper', yref: 'paper', x: 1, y: 1.02,
-            xanchor: 'right', yanchor: 'bottom',
-            text: 'DEMO',
-            showarrow: false,
-            font: { size: 12, color: '#7a5a00' },
-            bgcolor: 'rgba(255,193,7,0.14)',
-            bordercolor: 'rgba(255,193,7,0.35)',
-            borderwidth: 1,
-            borderpad: 4,
-          },
-        ],
-      };
-
-      const config = {
-        responsive: true,
-        displaylogo: false,
-        doubleClick: 'reset',
-        scrollZoom: true,
-        displayModeBar: true,
-        modeBarButtonsToAdd: ['zoomIn2d', 'zoomOut2d', 'resetScale2d'],
-      };
 
       const plotEl = document.getElementById('plot');
       plotEl.style.touchAction = 'none';
       plotEl.style.msTouchAction = 'none';
 
-      if (!state.plotInitialized) {
-        Plotly.newPlot(plotEl, traces, layout, config);
-        state.plotInitialized = true;
+      if (!window.__chart) {
+        window.__chart = echarts.init(plotEl);
+      }
 
-        plotEl.on('plotly_click', (ev) => {
-          if (!ev || !ev.points || ev.points.length === 0) return;
-          const point = ev.points.find((p) => p.customdata && p.customdata.type);
-          const meta = point ? point.customdata : state.hoverMeta;
+      const option = {
+        animation: false,
+        grid: { left: 60, right: 20, top: 20, bottom: 60, containLabel: true },
+        xAxis: {
+          type: 'value',
+          name: '월 변동성 (%)',
+          min: 0,
+          max: 16,
+          axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
+          splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
+        },
+        yAxis: {
+          type: 'value',
+          name: yTitle,
+          axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
+          splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
+        },
+        dataZoom: [
+          { type: 'inside', xAxisIndex: 0, filterMode: 'none' },
+          { type: 'inside', yAxisIndex: 0, filterMode: 'none' },
+        ],
+        tooltip: {
+          trigger: 'item',
+          backgroundColor: '#ffffff',
+          borderColor: 'rgba(0,0,0,0.08)',
+          borderWidth: 1,
+          textStyle: { color: '#111827', fontSize: 12 },
+          formatter: (params) => {
+            const meta = params.data && params.data.meta ? params.data.meta : null;
+            if (!meta) return '';
+            if (meta.type === 'portfolio') {
+              const bucket = params.data.name || '-';
+              return `${escapeHtml(bucket)} 포트폴리오<br>수익률: ${Number(params.data.value[1]).toFixed(1)}%<br>변동성: ${Number(params.data.value[0]).toFixed(2)}%`;
+            }
+            if (meta.type === 'etf') {
+              const item = state.scatterItems.find((x) => x.Code === meta.code);
+              if (!item) return '';
+              return `${escapeHtml(item.Name)} (${escapeHtml(item.Code)})<br>${escapeHtml(getReturnLabel(item))}: ${fmtPctFromRatioSafe(getReturnRatio(item), 1)}<br>변동성: ${fmtPct(item.risk_pct, 2)}`;
+            }
+            return '';
+          },
+        },
+        series,
+      };
+
+      window.__chart.setOption(option, true);
+      window.__chart.resize();
+
+      if (!window.__chartBound) {
+        window.__chartBound = true;
+        window.__chart.on('click', (params) => {
+          const meta = params && params.data && params.data.meta ? params.data.meta : null;
           if (!meta || !meta.type) return;
-
           if (meta.type === 'portfolio') {
             setSelectedPortfolio(meta.bucket);
             return;
           }
-
           if (meta.type === 'etf') {
             selectEtfByCode(meta.code);
           }
         });
 
-        plotEl.on('plotly_hover', (ev) => {
-          if (!ev || !ev.points || ev.points.length === 0) return;
-          const pt = ev.points.find((p) => p.customdata && p.customdata.type);
-          if (!pt) return;
-          const meta = pt.customdata;
+        window.__chart.on('mouseover', (params) => {
+          const meta = params && params.data && params.data.meta ? params.data.meta : null;
           if (!meta || !meta.type) return;
-          state.hoverPoint = { x: pt.x, y: pt.y, type: meta.type, meta };
           state.hoverMeta = meta;
+          if (meta.type === 'portfolio') {
+            state.hoverPoint = { type: 'portfolio', meta };
+          } else if (meta.type === 'etf') {
+            state.hoverPoint = { type: 'etf', meta };
+          }
           renderHoverInfo(meta);
-          renderPlot();
         });
 
-        plotEl.on('plotly_unhover', () => {
+        window.__chart.on('globalout', () => {
           state.hoverPoint = null;
           state.hoverMeta = null;
           resetHoverInfo();
-          renderPlot();
         });
 
-        return;
+        window.addEventListener('resize', () => {
+          if (window.__chart) {
+            window.__chart.resize();
+          }
+          if (window.__priceChart) {
+            window.__priceChart.resize();
+          }
+        });
       }
-
-      Plotly.react(plotEl, traces, layout, config);
     }
 
     function escapeHtml(str) {
@@ -1407,23 +1382,49 @@
 
     function renderPriceChart(dates, closes) {
       const chartEl = document.getElementById('priceChart');
-      const trace = {
-        type: 'scatter',
-        mode: 'lines',
-        x: dates,
-        y: closes,
-        line: { color: '#0d6efd', width: 2 },
-        hovertemplate: '%{x}<br>%{y:.2f}<extra></extra>',
+      if (!window.__priceChart) {
+        window.__priceChart = echarts.init(chartEl);
+      }
+      const option = {
+        animation: false,
+        grid: { left: 40, right: 10, top: 8, bottom: 28, containLabel: true },
+        xAxis: {
+          type: 'category',
+          data: dates,
+          axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
+          axisTick: { show: false },
+          splitLine: { show: false },
+        },
+        yAxis: {
+          type: 'value',
+          axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
+          splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
+        },
+        tooltip: {
+          trigger: 'axis',
+          backgroundColor: '#ffffff',
+          borderColor: 'rgba(0,0,0,0.08)',
+          borderWidth: 1,
+          textStyle: { color: '#111827', fontSize: 12 },
+          formatter: (params) => {
+            if (!params || !params.length) return '';
+            const p = params[0];
+            return `${escapeHtml(p.axisValue)}<br>${Number(p.data).toFixed(2)}`;
+          },
+        },
+        series: [
+          {
+            type: 'line',
+            data: closes,
+            smooth: true,
+            symbol: 'none',
+            lineStyle: { color: '#0d6efd', width: 2 },
+            areaStyle: { color: 'rgba(13,110,253,0.08)' },
+          },
+        ],
       };
-      const layout = {
-        margin: { l: 40, r: 10, t: 8, b: 28 },
-        xaxis: { showgrid: false },
-        yaxis: { showgrid: true, gridcolor: 'rgba(0,0,0,0.06)' },
-        paper_bgcolor: 'rgba(0,0,0,0)',
-        plot_bgcolor: '#ffffff',
-        height: 190,
-      };
-      Plotly.newPlot(chartEl, [trace], layout, { displaylogo: false, responsive: true });
+      window.__priceChart.setOption(option, true);
+      window.__priceChart.resize();
     }
 
     document.addEventListener('DOMContentLoaded', () => {
