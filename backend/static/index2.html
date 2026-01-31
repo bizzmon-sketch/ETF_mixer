@@ -422,6 +422,7 @@
       savedRebalancePlan: null,
       hoverPoint: null,
       hoverMeta: null,
+      zoom: null,
       plotInitialized: false,
     };
     const isMobile = window.matchMedia("(max-width: 768px)").matches;
@@ -598,11 +599,13 @@
     }
 
     function buildPlotTraces() {
-      const scatterData = state.scatterItems.map((item) => ({
-        value: [item.risk_pct, getReturnRatio(item) * 100],
-        name: `${item.Name} (${item.Code})`,
-        meta: { type: 'etf', code: item.Code },
-      }));
+      const scatterData = state.scatterItems
+        .filter((item) => Number(item.risk_pct) < 12)
+        .map((item) => ({
+          value: [item.risk_pct, getReturnRatio(item) * 100],
+          name: `${item.Name} (${item.Code})`,
+          meta: { type: 'etf', code: item.Code },
+        }));
 
       const hasSelectedPortfolio = Boolean(state.selectedPortfolioBucket);
       const recSizes = state.portfolios.map((item) => {
@@ -652,7 +655,7 @@
 
       if (state.selectedCode) {
         const item = state.scatterItems.find((x) => x.Code === state.selectedCode);
-        if (item) {
+        if (item && Number(item.risk_pct) < 12) {
           series.push({
             name: '선택됨',
             type: 'scatter',
@@ -676,6 +679,7 @@
             .map((holding) => {
               const match = state.scatterItems.find((item) => item.Code === holding.Code);
               if (!match) return null;
+              if (Number(match.risk_pct) >= 12) return null;
               return { ...holding, risk_pct: match.risk_pct, return_ratio: getReturnRatio(match) };
             })
             .filter(Boolean);
@@ -744,6 +748,22 @@
       const hasReturn120d = state.scatterItems.some((item) => item.return_120d !== undefined && item.return_120d !== null)
         || state.portfolios.some((item) => item.return_120d !== undefined && item.return_120d !== null);
       const yTitle = hasReturn120d ? '120일 수익률 (%)' : '6개월 수익률 (%)';
+      const grid = isMobile
+        ? { left: 44, right: 10, top: 12, bottom: 38, containLabel: true }
+        : { left: 54, right: 14, top: 12, bottom: 44, containLabel: true };
+      const zoomState = state.zoom || {};
+      const xZoom = zoomState.x || {};
+      const yZoom = zoomState.y || {};
+      const xZoomOpts = Number.isFinite(xZoom.start) && Number.isFinite(xZoom.end)
+        ? { start: xZoom.start, end: xZoom.end }
+        : (xZoom.startValue !== undefined && xZoom.endValue !== undefined
+          ? { startValue: xZoom.startValue, endValue: xZoom.endValue }
+          : {});
+      const yZoomOpts = Number.isFinite(yZoom.start) && Number.isFinite(yZoom.end)
+        ? { start: yZoom.start, end: yZoom.end }
+        : (yZoom.startValue !== undefined && yZoom.endValue !== undefined
+          ? { startValue: yZoom.startValue, endValue: yZoom.endValue }
+          : {});
 
       const plotEl = document.getElementById('plot');
       plotEl.style.touchAction = 'none';
@@ -755,24 +775,48 @@
 
       const option = {
         animation: false,
-        grid: { left: 60, right: 20, top: 20, bottom: 60, containLabel: true },
+        grid,
         xAxis: {
           type: 'value',
           name: '월 변동성 (%)',
+          nameLocation: 'middle',
+          nameGap: isMobile ? 32 : 34,
+          nameTextStyle: {
+            fontWeight: 'bold',
+            lineHeight: 14,
+            overflow: 'truncate',
+            width: isMobile ? 70 : 90,
+          },
           min: 0,
-          max: 16,
+          max: 12.2,
           axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
           splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
+          axisLabel: {
+            margin: 10,
+            formatter: (v) => Number(v).toFixed(0),
+          },
         },
         yAxis: {
           type: 'value',
           name: yTitle,
+          nameLocation: 'middle',
+          nameGap: isMobile ? 42 : 48,
+          nameTextStyle: {
+            fontWeight: 'bold',
+            lineHeight: 14,
+            overflow: 'truncate',
+            width: isMobile ? 80 : 110,
+          },
           axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
           splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
+          axisLabel: {
+            margin: 10,
+            formatter: (v) => Number(v).toFixed(0),
+          },
         },
         dataZoom: [
-          { type: 'inside', xAxisIndex: 0, filterMode: 'none' },
-          { type: 'inside', yAxisIndex: 0, filterMode: 'none' },
+          { type: 'inside', xAxisIndex: 0, filterMode: 'none', ...xZoomOpts },
+          { type: 'inside', yAxisIndex: 0, filterMode: 'none', ...yZoomOpts },
         ],
         tooltip: {
           trigger: 'item',
@@ -798,7 +842,7 @@
         series,
       };
 
-      window.__chart.setOption(option, true);
+      window.__chart.setOption(option, { notMerge: false, lazyUpdate: true, silent: true });
       window.__chart.resize();
 
       if (!window.__chartBound) {
@@ -813,6 +857,27 @@
           if (meta.type === 'etf') {
             selectEtfByCode(meta.code);
           }
+        });
+
+        window.__chart.on('datazoom', () => {
+          const option = window.__chart.getOption();
+          if (!option || !Array.isArray(option.dataZoom)) return;
+          const xZoom = option.dataZoom[0] || {};
+          const yZoom = option.dataZoom[1] || {};
+          state.zoom = {
+            x: {
+              start: xZoom.start,
+              end: xZoom.end,
+              startValue: xZoom.startValue,
+              endValue: xZoom.endValue,
+            },
+            y: {
+              start: yZoom.start,
+              end: yZoom.end,
+              startValue: yZoom.startValue,
+              endValue: yZoom.endValue,
+            },
+          };
         });
 
         window.__chart.on('mouseover', (params) => {
@@ -1202,7 +1267,12 @@
       ]);
 
       state.scatterItems = Array.isArray(scatter.items) ? scatter.items : [];
-      state.portfolios = Array.isArray(portfolios.items) ? portfolios.items : [];
+      state.portfolios = (Array.isArray(portfolios.items) ? portfolios.items : [])
+        .filter((item) => {
+          const bucket = String(item.risk_bucket || '');
+          if (bucket.startsWith('12')) return false;
+          return Number(item.risk_pct) < 12;
+        });
       state.selectedCode = null;
       state.selectedPortfolioBucket = null;
 
