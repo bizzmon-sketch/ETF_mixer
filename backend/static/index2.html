@@ -1426,6 +1426,13 @@
       statusEl.textContent = statusText || 'ETF를 선택하면 가격 추이가 표시됩니다.';
       const chartEl = document.getElementById('priceChart');
       if (chartEl) {
+        if (window.__priceChart) {
+          try {
+            window.__priceChart.dispose();
+          } catch (err) {
+          }
+          window.__priceChart = null;
+        }
         chartEl.innerHTML = '';
       }
     }
