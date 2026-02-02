@@ -749,7 +749,7 @@
         || state.portfolios.some((item) => item.return_120d !== undefined && item.return_120d !== null);
       const yTitle = hasReturn120d ? '120일 수익률 (%)' : '6개월 수익률 (%)';
       const grid = isMobile
-        ? { left: 44, right: 10, top: 12, bottom: 38, containLabel: true }
+        ? { left: 40, right: 10, top: 12, bottom: 38, containLabel: true }
         : { left: 54, right: 14, top: 12, bottom: 44, containLabel: true };
       const zoomState = state.zoom || {};
       const xZoom = zoomState.x || {};
@@ -798,7 +798,7 @@
         },
         yAxis: {
           type: 'value',
-          name: yTitle,
+          name: '',
           nameLocation: 'middle',
           nameGap: isMobile ? 42 : 48,
           nameTextStyle: {
@@ -810,10 +810,24 @@
           axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
           splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
           axisLabel: {
-            margin: 10,
+            margin: 8,
             formatter: (v) => Number(v).toFixed(0),
           },
         },
+        graphic: [
+          {
+            type: 'text',
+            left: (typeof grid.left === 'number' ? grid.left : 0) + 6,
+            top: (typeof grid.top === 'number' ? grid.top : 0) + 4,
+            style: {
+              text: '120일 수익률(%)',
+              fill: 'rgba(17, 24, 39, 0.7)',
+              fontSize: isMobile ? 11 : 12,
+              fontWeight: 500,
+            },
+            silent: true,
+          },
+        ],
         dataZoom: [
           { type: 'inside', xAxisIndex: 0, filterMode: 'none', ...xZoomOpts },
           { type: 'inside', yAxisIndex: 0, filterMode: 'none', ...yZoomOpts },
