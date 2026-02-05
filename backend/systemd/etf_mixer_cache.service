@@ -1,0 +1,20 @@
+﻿# Enable timer:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now etf_mixer_cache.timer
+# Run once after deploy:
+#   sudo systemctl start etf_mixer_cache.service
+
+[Unit]
+Description=ETF Mixer cache precompute
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/ETF_mixer
+ExecStart=/home/ubuntu/ETF_mixer/.venv/bin/python backend/cache_precompute.py
+User=ubuntu
+StandardOutput=append:/tmp/etf_mixer_cache.log
+StandardError=append:/tmp/etf_mixer_cache.log
+
+[Install]
+WantedBy=multi-user.target

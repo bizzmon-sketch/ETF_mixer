@@ -1,12 +1,59 @@
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
+import json
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
+
 import engine
 import portfolio_store
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 CORS(app)
 portfolio_store.init_db()
+
+
+BASE_DIR = os.path.dirname(__file__)
+CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
+
+
+def _now_kst_iso() -> str:
+  return datetime.now(timezone(timedelta(hours=9))).isoformat(timespec="seconds")
+
+
+def _attach_metadata(payload: object, source: str) -> object:
+  if isinstance(payload, dict):
+    enriched = dict(payload)
+    enriched["_cached_at"] = _now_kst_iso()
+    enriched["_source"] = source
+    return enriched
+  return payload
+
+
+def _read_json_cache(path: str) -> object | None:
+  try:
+    with open(path, "r", encoding="utf-8") as handle:
+      return json.load(handle)
+  except (OSError, json.JSONDecodeError):
+    return None
+
+
+def _write_json_atomic(path: str, payload: object) -> None:
+  try:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="tmp_", dir=os.path.dirname(path))
+    with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+      json.dump(payload, handle, ensure_ascii=False)
+      handle.flush()
+      os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+  except Exception:
+    try:
+      if 'tmp_path' in locals():
+        os.unlink(tmp_path)
+    except Exception:
+      pass
 
 
 @app.get("/")
@@ -21,8 +68,15 @@ def health():
 
 @app.get("/api/scatter")
 def scatter():
+  cache_path = os.path.join(CACHE_DIR, "scatter.json")
+  cached = _read_json_cache(cache_path)
+  if cached is not None:
+    return jsonify(cached)
   items = engine.get_scatter_data()
-  return jsonify({"count": len(items), "items": items})
+  payload = {"count": len(items), "items": items}
+  payload = _attach_metadata(payload, "runtime")
+  _write_json_atomic(cache_path, payload)
+  return jsonify(payload)
 
 
 @app.get("/api/recommendations")
@@ -49,7 +103,13 @@ def prices():
 def portfolios():
   strategy = request.args.get("strategy", "sampled")
   score = request.args.get("score", "sharpe")
+  cache_path = os.path.join(CACHE_DIR, f"portfolios_{strategy}_{score}.json")
+  cached = _read_json_cache(cache_path)
+  if cached is not None:
+    return jsonify(cached)
   payload = engine.get_portfolios(strategy=strategy, score=score)
+  payload = _attach_metadata(payload, "runtime")
+  _write_json_atomic(cache_path, payload)
   return jsonify(payload)
 
 

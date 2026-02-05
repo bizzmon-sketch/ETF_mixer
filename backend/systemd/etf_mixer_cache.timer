@@ -1,0 +1,17 @@
+﻿# Enable timer:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now etf_mixer_cache.timer
+# Run once after deploy:
+#   sudo systemctl start etf_mixer_cache.service
+
+[Unit]
+Description=Run ETF Mixer cache precompute every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+Unit=etf_mixer_cache.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
