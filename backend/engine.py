@@ -421,6 +421,15 @@ def _sort_candidates(df: pd.DataFrame) -> pd.DataFrame:
   return df.sort_values(["return_6m", "risk_pct", "Code"], ascending=[False, True, True])
 
 
+def _fallback_candidate_sort(df: pd.DataFrame) -> pd.DataFrame:
+  df = df.copy()
+  df["fallback_score"] = df["return_6m"] / df["risk_pct"].clip(lower=1e-6)
+  return df.sort_values(
+    ["fallback_score", "return_6m", "risk_pct", "Code"],
+    ascending=[False, False, True, True],
+  )
+
+
 def _allocate_portfolio_weights(
   holdings: List[Dict[str, object]],
   bucket_label: str,
@@ -779,21 +788,23 @@ def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> 
   df["asset_class"] = df["Name"].apply(classify_asset_class)
   df = _sort_candidates(df)
   topn_config = config.get("topN_by_class", 20)
-  if isinstance(topn_config, dict):
-    topn = int(topn_config.get("default", 20))
-  else:
-    topn = int(topn_config)
   pools: Dict[str, List[Dict[str, object]]] = {}
   for asset_class in ASSET_CLASSES:
+    if isinstance(topn_config, dict):
+      topn_default = int(topn_config.get("default", 20))
+      topn = int(topn_config.get(asset_class, topn_default))
+    else:
+      topn = int(topn_config)
     class_df = df[df["asset_class"] == asset_class]
     if class_df.empty:
       pools[asset_class] = []
       continue
     sharpe_df = class_df.dropna(subset=["sharpe_120d"]).copy()
     sharpe_df = sharpe_df.sort_values(["sharpe_120d", "return_6m", "risk_pct", "Code"], ascending=[False, False, True, True])
-    selected = sharpe_df.head(topn)
-    if selected.empty:
-      selected = class_df
+    if sharpe_df.empty:
+      selected = _fallback_candidate_sort(class_df).head(topn)
+    else:
+      selected = sharpe_df.head(topn)
     pools[asset_class] = [
       {
         "Code": row["Code"],
@@ -805,6 +816,260 @@ def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> 
       for _, row in selected.iterrows()
     ]
   return pools
+
+
+def _normalize_weights(weights: np.ndarray) -> np.ndarray:
+  weights = np.array(weights, dtype=float)
+  total = float(np.sum(weights))
+  if total <= 0:
+    return weights
+  return weights / total
+
+
+def _format_weight_percentages(weights: np.ndarray, decimals: int = 2) -> List[float]:
+  weights = _normalize_weights(weights)
+  percents = np.round(weights * 100, decimals=decimals)
+  diff = 100.0 - float(np.sum(percents))
+  if abs(diff) > 1e-6:
+    idx = int(np.argmax(percents))
+    percents[idx] = round(float(percents[idx] + diff), decimals)
+  return [float(value) for value in percents]
+
+
+def _qp_solve_weights(
+  mu: np.ndarray,
+  sigma: np.ndarray,
+  gamma: float,
+  solver: str | None = None,
+) -> np.ndarray | None:
+  try:
+    import cvxpy as cp
+  except Exception:
+    return None
+  n = len(mu)
+  if n == 0:
+    return None
+  w = cp.Variable(n, nonneg=True)
+  objective = cp.Maximize(mu @ w - gamma * cp.quad_form(w, sigma))
+  constraints = [cp.sum(w) == 1]
+  prob = cp.Problem(objective, constraints)
+  try:
+    if solver:
+      prob.solve(solver=solver, warm_start=True)
+    else:
+      prob.solve(warm_start=True)
+  except Exception:
+    return None
+  if w.value is None:
+    return None
+  return np.array(w.value, dtype=float).flatten()
+
+
+def _portfolio_risk_pct(weights: np.ndarray, sigma: np.ndarray) -> float | None:
+  if weights.size == 0:
+    return None
+  variance = float(weights.T @ sigma @ weights)
+  if variance < 0:
+    return None
+  daily_vol = np.sqrt(variance)
+  monthly_vol = daily_vol * np.sqrt(CONFIG["trading_days_month"]) * 100
+  return float(monthly_vol)
+
+
+def _generate_portfolios_qp(
+  metrics: pd.DataFrame,
+  config: Dict[str, object],
+  returns_tail: pd.DataFrame | None,
+  score_mode: str,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+  try:
+    import cvxpy  # noqa: F401
+    solver_available = True
+  except Exception:
+    solver_available = False
+
+  meta = {
+    "version": "qp-v1",
+    "topN_by_class": config.get("topN_by_class"),
+    "window_days": int(CONFIG["window_days"]),
+    "solver_available": solver_available,
+    "score_mode": score_mode,
+  }
+
+  pools = _build_candidate_pools(metrics, config)
+  meta["universe_counts"] = {key: len(value) for key, value in pools.items()}
+  if not pools or any(len(pools.get(cls, [])) == 0 for cls in ASSET_CLASSES):
+    items = []
+    for bucket in _bucket_bounds():
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "insufficient_candidates",
+      })
+    return items, meta
+
+  if not solver_available:
+    items = []
+    for bucket in _bucket_bounds():
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "missing_solver",
+      })
+    return items, meta
+
+  if returns_tail is None or returns_tail.empty:
+    items = []
+    for bucket in _bucket_bounds():
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "missing_covariance",
+      })
+    return items, meta
+
+  items: List[Dict[str, object]] = []
+  max_holdings = int(CONFIG["portfolio_max_holdings"])
+  if max_holdings < 4:
+    max_holdings = 4
+
+  for bucket in _bucket_bounds():
+    holdings_rows: List[Dict[str, object]] = []
+    used_codes: set[str] = set()
+    for asset_class in ASSET_CLASSES:
+      pool = pools.get(asset_class, [])
+      if not pool:
+        holdings_rows = []
+        break
+      top = pool[0]
+      holdings_rows.append(dict(top))
+      used_codes.add(top["Code"])
+
+    if not holdings_rows:
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "insufficient_candidates",
+      })
+      continue
+
+    extra_pool = (pools.get("Equity", []) + pools.get("Alt", []))
+    for row in extra_pool:
+      if len(holdings_rows) >= max_holdings:
+        break
+      if row["Code"] in used_codes:
+        continue
+      holdings_rows.append(dict(row))
+      used_codes.add(row["Code"])
+
+    codes = [h["Code"] for h in holdings_rows]
+    returns_slice = returns_tail.reindex(columns=codes).dropna(how="any")
+    if returns_slice.empty:
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "missing_covariance",
+      })
+      continue
+
+    sigma = returns_slice.cov().values
+    if np.isnan(sigma).any():
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "missing_covariance",
+      })
+      continue
+    sigma = (sigma + sigma.T) / 2
+    sigma = sigma + np.eye(len(codes)) * 1e-8
+
+    mu = np.array([float(h["return_6m"]) for h in holdings_rows], dtype=float)
+
+    gamma = 1.0
+    best_weights = None
+    best_risk = None
+    best_gamma = None
+    gamma_low = 1e-4
+    gamma_high = 1e4
+
+    for _ in range(12):
+      weights = _qp_solve_weights(mu, sigma, gamma)
+      if weights is None:
+        break
+      weights = _normalize_weights(weights)
+      risk_pct = _portfolio_risk_pct(weights, sigma)
+      best_weights = weights
+      best_risk = risk_pct
+      best_gamma = gamma
+      if risk_pct is None:
+        break
+      if _risk_in_bucket(risk_pct, bucket):
+        break
+      if bucket["max"] is None:
+        if risk_pct < float(bucket["min"]):
+          gamma_high = gamma
+          gamma = (gamma_low + gamma) / 2
+        else:
+          gamma_low = gamma
+          gamma = (gamma + gamma_high) / 2
+      else:
+        if risk_pct < float(bucket["min"]):
+          gamma_high = gamma
+          gamma = (gamma_low + gamma) / 2
+        else:
+          gamma_low = gamma
+          gamma = (gamma + gamma_high) / 2
+
+    if best_weights is None:
+      items.append({
+        "risk_bucket": bucket["label"],
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "solver_failed",
+      })
+      continue
+
+    weights_pct = _format_weight_percentages(best_weights, decimals=2)
+    holdings_output = []
+    total_return = 0.0
+    for holding, weight_pct in zip(holdings_rows, weights_pct):
+      total_return += (weight_pct / 100) * float(holding["return_6m"])
+      holdings_output.append({
+        "Code": holding["Code"],
+        "Name": holding["Name"],
+        "weight": float(weight_pct),
+        "asset_class": holding["asset_class"],
+      })
+
+    holdings_output = sorted(holdings_output, key=lambda h: (-h["weight"], h["Code"]))
+
+    items.append({
+      "risk_bucket": bucket["label"],
+      "risk_pct": best_risk,
+      "return_6m": total_return,
+      "holdings": holdings_output,
+      "meta": {
+        "gamma": best_gamma,
+        "within_bucket": _risk_in_bucket(best_risk, bucket) if best_risk is not None else False,
+        "lo": bucket["min"],
+        "hi": bucket["max"],
+      },
+    })
+
+  return items, meta
 
 
 def _sample_holding(rng: random.Random, pool: List[Dict[str, object]], used: set[str]) -> Dict[str, object] | None:
@@ -1274,6 +1539,8 @@ def generate_portfolios(
 
   if strategy == "sampled":
     items, meta = _generate_portfolios_sampled(metrics, default_config, returns_tail, score_mode)
+  elif strategy == "qp":
+    items, meta = _generate_portfolios_qp(metrics, default_config, returns_tail, score_mode)
   elif strategy == "grid":
     items, meta = _generate_portfolios_grid(metrics, default_config)
   elif strategy == "bucket_fallback":
