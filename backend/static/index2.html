@@ -612,9 +612,9 @@
 
       const hasSelectedPortfolio = Boolean(state.selectedPortfolioBucket);
       const recSizes = state.portfolios.map((item) => {
-        if (!hasSelectedPortfolio) return isMobile ? 22 : 14;
-        if (item.risk_bucket === state.selectedPortfolioBucket) return isMobile ? 22 : 14;
-        return isMobile ? 14 : 9;
+        if (!hasSelectedPortfolio) return (isMobile ? 22 : 14) * 0.8;
+        if (item.risk_bucket === state.selectedPortfolioBucket) return (isMobile ? 22 : 14) * 0.8;
+        return (isMobile ? 14 : 9) * 0.8;
       });
 
       const recommendationData = state.portfolios.map((item, idx) => ({
@@ -699,7 +699,7 @@
 
           overlayPointData = holdingPoints.map((h) => ({
             value: [h.risk_pct, h.return_ratio * 100],
-            symbolSize: CONFIG.sizes.etfPoint,
+            symbolSize: CONFIG.sizes.etfPoint * 2,
             meta: { type: 'etf', code: h.Code },
           }));
         }
