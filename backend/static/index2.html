@@ -1359,6 +1359,11 @@
     function setSelectedPortfolio(bucket) {
       const found = state.portfolios.find((item) => item.risk_bucket === bucket);
       if (!found) return;
+      if (window.__chart) {
+        window.__chart.dispatchAction({ type: 'downplay', seriesIndex: 0 });
+        window.__chart.dispatchAction({ type: 'hideTip' });
+        window.__chart.setOption({ series: [{ id: 'selectedRing', data: [] }] }, { notMerge: false, lazyUpdate: true, silent: true });
+      }
       state.selectedPortfolioBucket = found.risk_bucket;
       state.selectedCode = null;
       renderSidebar(found);
@@ -1532,6 +1537,14 @@
           max: maxVal * 1.02,
           axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
           splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
+          axisLabel: {
+            formatter: (value) => {
+              const num = Number(value);
+              if (!Number.isFinite(num)) return value;
+              const digits = Math.abs(num) >= 1000 ? 0 : 2;
+              return num.toLocaleString(undefined, { maximumFractionDigits: digits });
+            },
+          },
         },
         tooltip: {
           trigger: 'axis',
