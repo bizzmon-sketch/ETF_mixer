@@ -448,10 +448,13 @@
     }
 
     function scaleHoldingSize(weight) {
-      const minSize = CONFIG.sizes.holdingMin * CONFIG.sizes.holdingScale;
-      const maxSize = CONFIG.sizes.etfPoint * CONFIG.sizes.holdingScale;
       const ratio = normalizeWeight(weight);
-      return minSize + (maxSize - minSize) * ratio;
+      const base = CONFIG.sizes.holdingMin;
+      const step = CONFIG.sizes.holdingScale;
+      if (ratio >= 0.3) return base + step * 3;
+      if (ratio >= 0.2) return base + step * 2;
+      if (ratio >= 0.1) return base + step;
+      return base;
     }
 
     function setLastUpdated() {
@@ -1370,6 +1373,15 @@
       return filtered.findIndex((item) => normalizeCode(item.Code) === target);
     }
 
+    function focusEtfOnChartByCode(code) {
+      if (!window.__chart) return;
+      const dataIndex = getEtfScatterIndex(code);
+      if (dataIndex < 0) return;
+      window.__chart.dispatchAction({ type: 'downplay', seriesIndex: 0 });
+      window.__chart.dispatchAction({ type: 'highlight', seriesIndex: 0, dataIndex });
+      window.__chart.dispatchAction({ type: 'showTip', seriesIndex: 0, dataIndex });
+    }
+
     function clearPortfolioOverlay() {
       if (!window.__chart) return;
       window.__chart.setOption({
@@ -1389,19 +1401,11 @@
         return;
       }
       msg.textContent = '';
-      if (window.__chart) {
-        window.__chart.dispatchAction({ type: 'downplay', seriesIndex: 0 });
-      }
       state.selectedCode = found.Code;
       state.selectedPortfolioBucket = null;
-      clearPortfolioOverlay();
       renderSidebar(found);
       updateBucketTabActive();
-      renderPlot();
-      const dataIndex = getEtfScatterIndex(found.Code);
-      if (window.__chart && dataIndex >= 0) {
-        window.__chart.dispatchAction({ type: 'highlight', seriesIndex: 0, dataIndex });
-      }
+      focusEtfOnChartByCode(found.Code);
       loadPriceSeries(found);
     }
 
@@ -1507,6 +1511,8 @@
       if (!window.__priceChart) {
         window.__priceChart = echarts.init(chartEl);
       }
+      const minVal = closes.length ? Math.min(...closes) : 0;
+      const maxVal = closes.length ? Math.max(...closes) : 0;
       const option = {
         animation: false,
         grid: { left: 40, right: 10, top: 8, bottom: 28, containLabel: true },
@@ -1519,6 +1525,9 @@
         },
         yAxis: {
           type: 'value',
+          scale: true,
+          min: minVal * 0.98,
+          max: maxVal * 1.02,
           axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
           splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
         },
