@@ -657,6 +657,7 @@
         const item = state.scatterItems.find((x) => x.Code === state.selectedCode);
         if (item && Number(item.risk_pct) < 12) {
           series.push({
+            id: 'selectedRing',
             name: '선택됨',
             type: 'scatter',
             data: [{
@@ -672,6 +673,8 @@
         }
       }
 
+      let overlayLineData = [];
+      let overlayPointData = [];
       if (state.selectedPortfolioBucket) {
         const portfolio = state.portfolios.find((x) => x.risk_bucket === state.selectedPortfolioBucket);
         if (portfolio && Array.isArray(portfolio.holdings)) {
@@ -684,38 +687,42 @@
             })
             .filter(Boolean);
 
-          const lineData = [];
+          overlayLineData = [];
           for (const holding of holdingPoints) {
-            lineData.push([holding.risk_pct, holding.return_ratio * 100]);
-            lineData.push([portfolio.risk_pct, getReturnRatio(portfolio) * 100]);
-            lineData.push([null, null]);
+            overlayLineData.push([holding.risk_pct, holding.return_ratio * 100]);
+            overlayLineData.push([portfolio.risk_pct, getReturnRatio(portfolio) * 100]);
+            overlayLineData.push([null, null]);
           }
 
-          series.push({
-            name: '조합 연결선',
-            type: 'line',
-            data: lineData,
-            lineStyle: { color: 'rgba(140,140,140,0.25)', width: 2 },
-            symbol: 'none',
-            connectNulls: false,
-            z: 1,
-            clip: true,
-          });
-
-          series.push({
-            name: '포트폴리오 구성',
-            type: 'scatter',
-            data: holdingPoints.map((h) => ({
-              value: [h.risk_pct, h.return_ratio * 100],
-              symbolSize: scaleHoldingSize(h.weight),
-              meta: { type: 'etf', code: h.Code },
-            })),
-            itemStyle: { color: '#7bd389', borderColor: 'rgba(82,130,92,0.6)', borderWidth: 1.5 },
-            clip: true,
-            z: 3,
-          });
+          overlayPointData = holdingPoints.map((h) => ({
+            value: [h.risk_pct, h.return_ratio * 100],
+            symbolSize: scaleHoldingSize(h.weight),
+            meta: { type: 'etf', code: h.Code },
+          }));
         }
       }
+
+      series.push({
+        id: 'portfolioOverlayLine',
+        name: 'portfolioOverlayLine',
+        type: 'line',
+        data: overlayLineData,
+        lineStyle: { color: 'rgba(140,140,140,0.25)', width: 2 },
+        symbol: 'none',
+        connectNulls: false,
+        z: 1,
+        clip: true,
+      });
+
+      series.push({
+        id: 'portfolioOverlayPoints',
+        name: 'portfolioOverlayPoints',
+        type: 'scatter',
+        data: overlayPointData,
+        itemStyle: { color: '#7bd389', borderColor: 'rgba(82,130,92,0.6)', borderWidth: 1.5 },
+        clip: true,
+        z: 3,
+      });
 
       return series;
     }
@@ -749,7 +756,7 @@
         || state.portfolios.some((item) => item.return_120d !== undefined && item.return_120d !== null);
       const yTitle = hasReturn120d ? '120일 수익률 (%)' : '6개월 수익률 (%)';
       const grid = isMobile
-        ? { left: 40, right: 10, top: 12, bottom: 38, containLabel: true }
+        ? { left: 28, right: 10, top: 12, bottom: 38, containLabel: true }
         : { left: 54, right: 14, top: 12, bottom: 44, containLabel: true };
       const zoomState = state.zoom || {};
       const xZoom = zoomState.x || {};
@@ -810,7 +817,7 @@
           axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
           splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } },
           axisLabel: {
-            margin: 8,
+            margin: 4,
             formatter: (v) => Number(v).toFixed(0),
           },
         },
@@ -1357,6 +1364,22 @@
       updatePricePanel(null);
     }
 
+    function getEtfScatterIndex(code) {
+      const target = normalizeCode(code);
+      const filtered = state.scatterItems.filter((item) => Number(item.risk_pct) < 12);
+      return filtered.findIndex((item) => normalizeCode(item.Code) === target);
+    }
+
+    function clearPortfolioOverlay() {
+      if (!window.__chart) return;
+      window.__chart.setOption({
+        series: [
+          { id: 'portfolioOverlayLine', data: [] },
+          { id: 'portfolioOverlayPoints', data: [] },
+        ],
+      }, { notMerge: false, lazyUpdate: true, silent: true });
+    }
+
     function selectEtfByCode(code) {
       const target = normalizeCode(code);
       const found = state.scatterItems.find((item) => normalizeCode(item.Code) === target);
@@ -1366,11 +1389,19 @@
         return;
       }
       msg.textContent = '';
+      if (window.__chart) {
+        window.__chart.dispatchAction({ type: 'downplay', seriesIndex: 0 });
+      }
       state.selectedCode = found.Code;
       state.selectedPortfolioBucket = null;
+      clearPortfolioOverlay();
       renderSidebar(found);
       updateBucketTabActive();
       renderPlot();
+      const dataIndex = getEtfScatterIndex(found.Code);
+      if (window.__chart && dataIndex >= 0) {
+        window.__chart.dispatchAction({ type: 'highlight', seriesIndex: 0, dataIndex });
+      }
       loadPriceSeries(found);
     }
 
