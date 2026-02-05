@@ -699,7 +699,7 @@
 
           overlayPointData = holdingPoints.map((h) => ({
             value: [h.risk_pct, h.return_ratio * 100],
-            symbolSize: scaleHoldingSize(h.weight),
+            symbolSize: CONFIG.sizes.etfPoint,
             meta: { type: 'etf', code: h.Code },
           }));
         }
@@ -1403,6 +1403,8 @@
       msg.textContent = '';
       state.selectedCode = found.Code;
       state.selectedPortfolioBucket = null;
+      clearPortfolioOverlay();
+      renderPlot();
       renderSidebar(found);
       updateBucketTabActive();
       focusEtfOnChartByCode(found.Code);
