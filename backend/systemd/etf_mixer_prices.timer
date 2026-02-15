@@ -1,0 +1,16 @@
+# Enable timer:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now etf_mixer_prices.timer
+# Run once after deploy:
+#   sudo systemctl start etf_mixer_prices.service
+
+[Unit]
+Description=Run ETF Mixer daily price update at 07:10 UTC (16:10 KST)
+
+[Timer]
+OnCalendar=*-*-* 07:10:00
+Unit=etf_mixer_prices.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

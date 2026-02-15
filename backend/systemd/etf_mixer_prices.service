@@ -1,0 +1,21 @@
+# Enable timer:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now etf_mixer_prices.timer
+# Run once after deploy:
+#   sudo systemctl start etf_mixer_prices.service
+
+[Unit]
+Description=ETF Mixer daily price update
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ETF_mixer
+Environment="PYTHONPATH=/home/ubuntu/ETF_mixer/backend"
+ExecStart=/home/ubuntu/ETF_mixer/.venv/bin/python /home/ubuntu/ETF_mixer/backend/update_prices.py
+StandardOutput=append:/tmp/etf_mixer_prices.log
+StandardError=append:/tmp/etf_mixer_prices.log
+
+[Install]
+WantedBy=multi-user.target
