@@ -896,52 +896,75 @@ def _generate_portfolios_qp(
     "solver_available": solver_available,
     "score_mode": score_mode,
   }
+  stage0_df = metrics.dropna(subset=["Code", "Name"]).copy()
+  bucket_stage: Dict[str, Dict[str, object]] = {}
+  for bucket in _bucket_bounds():
+    label = bucket["label"]
+    s1_df = stage0_df[stage0_df["risk_bucket"] == label].copy()
+    s2_df = s1_df.dropna(subset=["return_6m", "risk_pct", "sharpe_120d"]).copy()
+    class_counts = {asset_class: 0 for asset_class in ASSET_CLASSES}
+    unknown_count = 0
+    if not s2_df.empty:
+      s2_df["asset_class"] = s2_df["Name"].apply(classify_asset_class)
+      known_mask = s2_df["asset_class"].isin(ASSET_CLASSES)
+      unknown_count = int((~known_mask).sum())
+      s3_df = s2_df.loc[known_mask]
+      class_counts = {
+        asset_class: int((s3_df["asset_class"] == asset_class).sum())
+        for asset_class in ASSET_CLASSES
+      }
+    feasible_before = all(class_counts[asset_class] >= 1 for asset_class in ASSET_CLASSES)
+    required_classes = [asset_class for asset_class in ASSET_CLASSES if class_counts[asset_class] > 0]
+    relaxed_classes = [asset_class for asset_class in ASSET_CLASSES if class_counts[asset_class] == 0]
+    bucket_stage[label] = {
+      "S1_bucket": int(len(s1_df)),
+      "S2_metrics_non_nan": int(len(s2_df)),
+      "class_counts": class_counts,
+      "unknown_count": int(unknown_count),
+      "feasible_before": int(1 if feasible_before else 0),
+      "required_classes": required_classes,
+      "relaxed_classes": relaxed_classes,
+    }
   qp_audit = None
   if debug:
-    stage0_df = metrics.dropna(subset=["Code", "Name"]).copy()
     qp_audit = {
       "S0_universe": int(len(stage0_df)),
       "buckets": {},
     }
-    for bucket in _bucket_bounds():
-      label = bucket["label"]
-      s1_df = stage0_df[stage0_df["risk_bucket"] == label].copy()
-      s2_df = s1_df.dropna(subset=["return_6m", "risk_pct", "sharpe_120d"]).copy()
-      class_counts = {asset_class: 0 for asset_class in ASSET_CLASSES}
-      unknown_count = 0
-      if not s2_df.empty:
-        s2_df["asset_class"] = s2_df["Name"].apply(classify_asset_class)
-        known_mask = s2_df["asset_class"].isin(ASSET_CLASSES)
-        unknown_count = int((~known_mask).sum())
-        s3_df = s2_df.loc[known_mask]
-        class_counts = {
-          asset_class: int((s3_df["asset_class"] == asset_class).sum())
-          for asset_class in ASSET_CLASSES
-        }
-      feasible = all(class_counts[asset_class] >= 1 for asset_class in ASSET_CLASSES)
+    for label, stage in bucket_stage.items():
+      class_counts = stage["class_counts"]
       qp_audit["buckets"][label] = {
-        "S1_bucket": int(len(s1_df)),
-        "S2_metrics_non_nan": int(len(s2_df)),
+        "S1_bucket": int(stage["S1_bucket"]),
+        "S2_metrics_non_nan": int(stage["S2_metrics_non_nan"]),
         "S3_asset_class": {
           "known": int(sum(class_counts.values())),
-          "unknown": int(unknown_count),
+          "unknown": int(stage["unknown_count"]),
           "by_class": class_counts,
         },
-        "S4_class_min_feasible": int(1 if feasible else 0),
+        "S4_class_min_feasible": int(stage["feasible_before"]),
         "S5_portfolios_produced": 0,
       }
 
   pools = _build_candidate_pools(metrics, config)
   meta["universe_counts"] = {key: len(value) for key, value in pools.items()}
-  if not pools or any(len(pools.get(cls, [])) == 0 for cls in ASSET_CLASSES):
+  if not pools:
     items = []
     for bucket in _bucket_bounds():
+      label = bucket["label"]
+      stage = bucket_stage.get(label, {})
       items.append({
-        "risk_bucket": bucket["label"],
+        "risk_bucket": label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "insufficient_candidates",
+        "meta": {
+          "constraints": {
+            "required_classes": list(stage.get("required_classes", [])),
+            "relaxed_classes": list(stage.get("relaxed_classes", ASSET_CLASSES)),
+            "feasible_before": int(stage.get("feasible_before", 0)),
+          },
+        },
       })
     if qp_audit is not None:
       meta["qp_audit"] = qp_audit
@@ -981,9 +1004,27 @@ def _generate_portfolios_qp(
     max_holdings = 4
 
   for bucket in _bucket_bounds():
+    bucket_label = bucket["label"]
+    stage = bucket_stage.get(bucket_label, {})
+    required_classes = list(stage.get("required_classes", []))
+    relaxed_classes = list(stage.get("relaxed_classes", []))
+    feasible_before = int(stage.get("feasible_before", 0))
+    if not required_classes:
+      # If the bucket has no class-qualified names, relax all class mins and use any available pools.
+      required_classes = []
+      relaxed_classes = list(ASSET_CLASSES)
+    constraints_meta = {
+      "required_classes": required_classes,
+      "relaxed_classes": relaxed_classes,
+      "feasible_before": feasible_before,
+    }
+
     holdings_rows: List[Dict[str, object]] = []
     used_codes: set[str] = set()
-    for asset_class in ASSET_CLASSES:
+    classes_to_seed = required_classes if required_classes else [
+      asset_class for asset_class in ASSET_CLASSES if len(pools.get(asset_class, [])) > 0
+    ][:1]
+    for asset_class in classes_to_seed:
       pool = pools.get(asset_class, [])
       if not pool:
         holdings_rows = []
@@ -994,11 +1035,14 @@ def _generate_portfolios_qp(
 
     if not holdings_rows:
       items.append({
-        "risk_bucket": bucket["label"],
+        "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "insufficient_candidates",
+        "meta": {
+          "constraints": constraints_meta,
+        },
       })
       continue
 
@@ -1015,22 +1059,28 @@ def _generate_portfolios_qp(
     returns_slice = returns_tail.reindex(columns=codes).dropna(how="any")
     if returns_slice.empty:
       items.append({
-        "risk_bucket": bucket["label"],
+        "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "missing_covariance",
+        "meta": {
+          "constraints": constraints_meta,
+        },
       })
       continue
 
     sigma = returns_slice.cov().values
     if np.isnan(sigma).any():
       items.append({
-        "risk_bucket": bucket["label"],
+        "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "missing_covariance",
+        "meta": {
+          "constraints": constraints_meta,
+        },
       })
       continue
     sigma = (sigma + sigma.T) / 2
@@ -1075,18 +1125,62 @@ def _generate_portfolios_qp(
 
     if best_weights is None:
       items.append({
-        "risk_bucket": bucket["label"],
+        "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "solver_failed",
+        "meta": {
+          "constraints": constraints_meta,
+        },
       })
       continue
 
-    weights_pct = _format_weight_percentages(best_weights, decimals=2)
+    # Output sanitation: drop tiny/zero weights and renormalize remaining to 100%.
+    cleaned_indices = [idx for idx, weight in enumerate(best_weights.tolist()) if float(weight) > 1e-6]
+    if not cleaned_indices:
+      items.append({
+        "risk_bucket": bucket_label,
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "solver_failed",
+        "meta": {
+          "constraints": constraints_meta,
+        },
+      })
+      continue
+    cleaned_weights = _normalize_weights(best_weights[cleaned_indices])
+    cleaned_holdings_rows = [holdings_rows[idx] for idx in cleaned_indices]
+    sigma_clean = sigma[np.ix_(cleaned_indices, cleaned_indices)]
+    cleaned_risk = _portfolio_risk_pct(cleaned_weights, sigma_clean)
+
+    weights_pct = _format_weight_percentages(cleaned_weights, decimals=2)
+    positive_pairs = [
+      (holding, weight_pct)
+      for holding, weight_pct in zip(cleaned_holdings_rows, weights_pct)
+      if float(weight_pct) > 0
+    ]
+    if not positive_pairs:
+      items.append({
+        "risk_bucket": bucket_label,
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "solver_failed",
+        "meta": {
+          "constraints": constraints_meta,
+        },
+      })
+      continue
+    if len(positive_pairs) != len(cleaned_holdings_rows):
+      cleaned_holdings_rows = [holding for holding, _ in positive_pairs]
+      cleaned_weights = _normalize_weights(np.array([float(weight_pct) for _, weight_pct in positive_pairs], dtype=float))
+      weights_pct = _format_weight_percentages(cleaned_weights, decimals=2)
+
     holdings_output = []
     total_return = 0.0
-    for holding, weight_pct in zip(holdings_rows, weights_pct):
+    for holding, weight_pct in zip(cleaned_holdings_rows, weights_pct):
       total_return += (weight_pct / 100) * float(holding["return_6m"])
       holdings_output.append({
         "Code": holding["Code"],
@@ -1098,15 +1192,16 @@ def _generate_portfolios_qp(
     holdings_output = sorted(holdings_output, key=lambda h: (-h["weight"], h["Code"]))
 
     items.append({
-      "risk_bucket": bucket["label"],
-      "risk_pct": best_risk,
+      "risk_bucket": bucket_label,
+      "risk_pct": cleaned_risk,
       "return_6m": total_return,
       "holdings": holdings_output,
       "meta": {
         "gamma": best_gamma,
-        "within_bucket": _risk_in_bucket(best_risk, bucket) if best_risk is not None else False,
+        "within_bucket": _risk_in_bucket(cleaned_risk, bucket) if cleaned_risk is not None else False,
         "lo": bucket["min"],
         "hi": bucket["max"],
+        "constraints": constraints_meta,
       },
     })
 
