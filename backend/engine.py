@@ -20,7 +20,7 @@ CONFIG = {
   "months": 6,
   "min_observations": 90,
   "trading_days_month": 21,
-  "window_days": 120,
+  "window_days": 260,
   "cache_ttl_sec": 600,
   "refresh_buffer_days": 3,
   "refresh_interval_sec": 600,
@@ -782,11 +782,10 @@ def _bucket_target(bucket: Dict[str, object]) -> float:
 
 
 def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> Dict[str, List[Dict[str, object]]]:
-  df = metrics.dropna(subset=["Code", "Name", "return_6m", "risk_pct"]).copy()
+  df = metrics.dropna(subset=["Code", "Name", "return_6m", "risk_pct", "sharpe_120d"]).copy()
   if df.empty:
     return {}
   df["asset_class"] = df["Name"].apply(classify_asset_class)
-  df = _sort_candidates(df)
   topn_config = config.get("topN_by_class", 20)
   pools: Dict[str, List[Dict[str, object]]] = {}
   for asset_class in ASSET_CLASSES:
@@ -799,18 +798,17 @@ def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> 
     if class_df.empty:
       pools[asset_class] = []
       continue
-    sharpe_df = class_df.dropna(subset=["sharpe_120d"]).copy()
-    sharpe_df = sharpe_df.sort_values(["sharpe_120d", "return_6m", "risk_pct", "Code"], ascending=[False, False, True, True])
-    if sharpe_df.empty:
-      selected = _fallback_candidate_sort(class_df).head(topn)
-    else:
-      selected = sharpe_df.head(topn)
+    selected = class_df.sort_values(
+      ["sharpe_120d", "return_6m", "risk_pct", "Code"],
+      ascending=[False, False, True, True],
+    ).head(topn)
     pools[asset_class] = [
       {
         "Code": row["Code"],
         "Name": row["Name"],
         "return_6m": float(row["return_6m"]),
         "risk_pct": float(row["risk_pct"]),
+        "sharpe_window": float(row["sharpe_120d"]),
         "asset_class": asset_class,
       }
       for _, row in selected.iterrows()
@@ -840,6 +838,7 @@ def _qp_solve_weights(
   mu: np.ndarray,
   sigma: np.ndarray,
   gamma: float,
+  upper_bounds: np.ndarray | None = None,
   solver: str | None = None,
 ) -> np.ndarray | None:
   try:
@@ -852,6 +851,8 @@ def _qp_solve_weights(
   w = cp.Variable(n, nonneg=True)
   objective = cp.Maximize(mu @ w - gamma * cp.quad_form(w, sigma))
   constraints = [cp.sum(w) == 1]
+  if upper_bounds is not None and len(upper_bounds) == n:
+    constraints.append(w <= np.array(upper_bounds, dtype=float))
   prob = cp.Problem(objective, constraints)
   try:
     if solver:
@@ -876,6 +877,102 @@ def _portfolio_risk_pct(weights: np.ndarray, sigma: np.ndarray) -> float | None:
   return float(monthly_vol)
 
 
+def _project_weights_with_bounds(
+  target: np.ndarray,
+  lower: np.ndarray,
+  upper: np.ndarray,
+  max_iter: int = 300,
+) -> np.ndarray | None:
+  target = np.array(target, dtype=float)
+  lower = np.array(lower, dtype=float)
+  upper = np.array(upper, dtype=float)
+  if target.size == 0 or lower.size != target.size or upper.size != target.size:
+    return None
+  if float(np.sum(lower)) > 1.0 + 1e-9:
+    return None
+  if float(np.sum(upper)) < 1.0 - 1e-9:
+    return None
+  w = np.minimum(np.maximum(target, lower), upper)
+  for _ in range(max_iter):
+    diff = 1.0 - float(np.sum(w))
+    if abs(diff) <= 1e-10:
+      break
+    if diff > 0:
+      room = upper - w
+      free = room > 1e-12
+      capacity = float(np.sum(room[free]))
+      if capacity <= 1e-12:
+        return None
+      w[free] += diff * (room[free] / capacity)
+    else:
+      room = w - lower
+      free = room > 1e-12
+      capacity = float(np.sum(room[free]))
+      if capacity <= 1e-12:
+        return None
+      w[free] += diff * (room[free] / capacity)
+    w = np.minimum(np.maximum(w, lower), upper)
+  total = float(np.sum(w))
+  if total <= 0:
+    return None
+  w = w / total
+  if np.any(w < (lower - 1e-6)) or np.any(w > (upper + 1e-6)):
+    return None
+  return w
+
+
+def _compute_portfolio_sharpe_from_returns(
+  returns_tail: pd.DataFrame,
+  codes: List[str],
+  weights: np.ndarray,
+) -> float | None:
+  if returns_tail is None or returns_tail.empty or not codes:
+    return None
+  returns_slice = returns_tail.reindex(columns=codes).dropna(how="any")
+  if returns_slice.empty:
+    return None
+  rp = returns_slice.mul(weights, axis=1).sum(axis=1)
+  if rp.empty:
+    return None
+  std = rp.std()
+  if std is None or np.isnan(std) or std == 0:
+    return None
+  return float((rp.mean() / std) * np.sqrt(252))
+
+
+def _select_qp_holdings_topk(
+  holdings_rows: List[Dict[str, object]],
+  raw_weights: np.ndarray,
+  required_classes: List[str],
+  max_holdings: int,
+  min_weight: float,
+) -> Tuple[List[int], bool]:
+  idx_sorted = sorted(
+    range(len(holdings_rows)),
+    key=lambda i: (-float(raw_weights[i]), -float(holdings_rows[i].get("sharpe_window", 0.0)), holdings_rows[i]["Code"]),
+  )
+  if not idx_sorted:
+    return [], False
+  selected: List[int] = []
+  for asset_class in required_classes:
+    candidate_idx = next((i for i in idx_sorted if holdings_rows[i]["asset_class"] == asset_class), None)
+    if candidate_idx is not None and candidate_idx not in selected:
+      selected.append(candidate_idx)
+  for idx in idx_sorted:
+    if len(selected) >= max_holdings:
+      break
+    if idx in selected:
+      continue
+    selected.append(idx)
+  if not selected:
+    return [], False
+  if len(selected) > max_holdings:
+    selected = selected[:max_holdings]
+  # Policy point: if required classes exceed display capacity, we keep the best max_holdings assets and mark constraints unmet in meta/debug.
+  truncated = len([i for i in idx_sorted if float(raw_weights[i]) > 1e-6]) > max_holdings
+  return selected, truncated
+
+
 def _generate_portfolios_qp(
   metrics: pd.DataFrame,
   config: Dict[str, object],
@@ -889,163 +986,136 @@ def _generate_portfolios_qp(
   except Exception:
     solver_available = False
 
+  topn_config = config.get("topN_by_class", 20)
   meta = {
-    "version": "qp-v1",
-    "topN_by_class": config.get("topN_by_class"),
+    "version": "qp-v2",
+    "topN_by_class": topn_config,
     "window_days": int(CONFIG["window_days"]),
+    "window_weeks": 52,
     "solver_available": solver_available,
-    "score_mode": score_mode,
+    "score_mode": "sharpe",
+    "sharpe_window": int(CONFIG["window_days"]),
   }
-  stage0_df = metrics.dropna(subset=["Code", "Name"]).copy()
-  bucket_stage: Dict[str, Dict[str, object]] = {}
-  for bucket in _bucket_bounds():
-    label = bucket["label"]
-    s1_df = stage0_df[stage0_df["risk_bucket"] == label].copy()
-    s2_df = s1_df.dropna(subset=["return_6m", "risk_pct", "sharpe_120d"]).copy()
-    class_counts = {asset_class: 0 for asset_class in ASSET_CLASSES}
-    unknown_count = 0
-    if not s2_df.empty:
-      s2_df["asset_class"] = s2_df["Name"].apply(classify_asset_class)
-      known_mask = s2_df["asset_class"].isin(ASSET_CLASSES)
-      unknown_count = int((~known_mask).sum())
-      s3_df = s2_df.loc[known_mask]
-      class_counts = {
-        asset_class: int((s3_df["asset_class"] == asset_class).sum())
-        for asset_class in ASSET_CLASSES
-      }
-    feasible_before = all(class_counts[asset_class] >= 1 for asset_class in ASSET_CLASSES)
-    required_classes = [asset_class for asset_class in ASSET_CLASSES if class_counts[asset_class] > 0]
-    relaxed_classes = [asset_class for asset_class in ASSET_CLASSES if class_counts[asset_class] == 0]
-    bucket_stage[label] = {
-      "S1_bucket": int(len(s1_df)),
-      "S2_metrics_non_nan": int(len(s2_df)),
-      "class_counts": class_counts,
-      "unknown_count": int(unknown_count),
-      "feasible_before": int(1 if feasible_before else 0),
-      "required_classes": required_classes,
-      "relaxed_classes": relaxed_classes,
-    }
+
+  pools = _build_candidate_pools(metrics, config)
+  by_class_counts = {asset_class: len(pools.get(asset_class, [])) for asset_class in ASSET_CLASSES}
+  required_classes = [asset_class for asset_class in ASSET_CLASSES if by_class_counts[asset_class] > 0]
+  relaxed_classes = [asset_class for asset_class in ASSET_CLASSES if by_class_counts[asset_class] == 0]
+  feasible_before = int(1 if len(relaxed_classes) == 0 else 0)
+  meta["universe_counts"] = by_class_counts
+
+  holdings_rows: List[Dict[str, object]] = []
+  used_codes: set[str] = set()
+  for asset_class in ASSET_CLASSES:
+    for row in pools.get(asset_class, []):
+      code = row["Code"]
+      if code in used_codes:
+        continue
+      holdings_rows.append(dict(row))
+      used_codes.add(code)
+
   qp_audit = None
   if debug:
     qp_audit = {
-      "S0_universe": int(len(stage0_df)),
+      "S0_universe": int(len(metrics.dropna(subset=["Code", "Name"]))),
       "buckets": {},
     }
-    for label, stage in bucket_stage.items():
-      class_counts = stage["class_counts"]
-      qp_audit["buckets"][label] = {
-        "S1_bucket": int(stage["S1_bucket"]),
-        "S2_metrics_non_nan": int(stage["S2_metrics_non_nan"]),
-        "S3_asset_class": {
-          "known": int(sum(class_counts.values())),
-          "unknown": int(stage["unknown_count"]),
-          "by_class": class_counts,
+    for bucket in _bucket_bounds():
+      qp_audit["buckets"][bucket["label"]] = {
+        "S1_candidate_topN": {
+          "by_class": dict(by_class_counts),
+          "total": int(len(holdings_rows)),
         },
-        "S4_class_min_feasible": int(stage["feasible_before"]),
+        "S2_metrics_non_nan": int(len(holdings_rows)),
+        "S3_asset_class": {
+          "known": int(sum(by_class_counts.values())),
+          "unknown": 0,
+          "by_class": dict(by_class_counts),
+        },
+        "S4_class_min_feasible": int(feasible_before),
         "S5_portfolios_produced": 0,
+        "solver_failure_reason": None,
       }
 
-  pools = _build_candidate_pools(metrics, config)
-  meta["universe_counts"] = {key: len(value) for key, value in pools.items()}
-  if not pools:
-    items = []
-    for bucket in _bucket_bounds():
-      label = bucket["label"]
-      stage = bucket_stage.get(label, {})
-      items.append({
-        "risk_bucket": label,
-        "risk_pct": None,
-        "return_6m": None,
-        "holdings": [],
-        "error": "insufficient_candidates",
-        "meta": {
-          "constraints": {
-            "required_classes": list(stage.get("required_classes", [])),
-            "relaxed_classes": list(stage.get("relaxed_classes", ASSET_CLASSES)),
-            "feasible_before": int(stage.get("feasible_before", 0)),
-          },
-        },
-      })
-    if qp_audit is not None:
-      meta["qp_audit"] = qp_audit
-    return items, meta
+  items: List[Dict[str, object]] = []
+  max_holdings = min(int(CONFIG["portfolio_max_holdings"]), 10)
+  min_weight = 0.05
 
   if not solver_available:
-    items = []
     for bucket in _bucket_bounds():
+      constraints_meta = {
+        "required_classes": required_classes,
+        "relaxed_classes": relaxed_classes,
+        "feasible_before": feasible_before,
+      }
+      if debug:
+        constraints_meta.update({
+          "constraints_met": False,
+          "missing_required_classes": list(required_classes),
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": False,
+        })
+        qp_audit["buckets"][bucket["label"]]["solver_failure_reason"] = "missing_solver"
       items.append({
         "risk_bucket": bucket["label"],
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "missing_solver",
+        "meta": {
+          "constraints": constraints_meta,
+        },
       })
     if qp_audit is not None:
       meta["qp_audit"] = qp_audit
     return items, meta
 
   if returns_tail is None or returns_tail.empty:
-    items = []
     for bucket in _bucket_bounds():
+      constraints_meta = {
+        "required_classes": required_classes,
+        "relaxed_classes": relaxed_classes,
+        "feasible_before": feasible_before,
+      }
+      if debug:
+        constraints_meta.update({
+          "constraints_met": False,
+          "missing_required_classes": list(required_classes),
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": False,
+        })
+        qp_audit["buckets"][bucket["label"]]["solver_failure_reason"] = "missing_covariance"
       items.append({
         "risk_bucket": bucket["label"],
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "missing_covariance",
+        "meta": {
+          "constraints": constraints_meta,
+        },
       })
     if qp_audit is not None:
       meta["qp_audit"] = qp_audit
     return items, meta
 
-  items: List[Dict[str, object]] = []
-  max_holdings = int(CONFIG["portfolio_max_holdings"])
-  if max_holdings < 4:
-    max_holdings = 4
-
-  for bucket in _bucket_bounds():
-    bucket_label = bucket["label"]
-    stage = bucket_stage.get(bucket_label, {})
-    required_classes = list(stage.get("required_classes", []))
-    relaxed_classes = list(stage.get("relaxed_classes", []))
-    feasible_before = int(stage.get("feasible_before", 0))
-    if not required_classes:
-      # If the bucket has no class-qualified names, relax all class mins and use any available pools.
-      required_classes = []
-      relaxed_classes = list(ASSET_CLASSES)
-    constraints_meta = {
-      "required_classes": required_classes,
-      "relaxed_classes": relaxed_classes,
-      "feasible_before": feasible_before,
-    }
-    if debug:
-      constraints_meta.update({
-        "constraints_met": False,
-        "missing_required_classes": list(required_classes),
-        "holdings_display_limit": int(max_holdings),
-        "holdings_display_truncated": False,
-      })
-
-    holdings_rows: List[Dict[str, object]] = []
-    used_codes: set[str] = set()
-    classes_to_seed = required_classes if required_classes else [
-      asset_class for asset_class in ASSET_CLASSES if len(pools.get(asset_class, [])) > 0
-    ][:1]
-    for asset_class in classes_to_seed:
-      pool = pools.get(asset_class, [])
-      if not pool:
-        holdings_rows = []
-        break
-      top = pool[0]
-      holdings_rows.append(dict(top))
-      used_codes.add(top["Code"])
-
-    if not holdings_rows:
+  if not holdings_rows:
+    for bucket in _bucket_bounds():
+      constraints_meta = {
+        "required_classes": required_classes,
+        "relaxed_classes": relaxed_classes,
+        "feasible_before": feasible_before,
+      }
       if debug:
-        constraints_meta["constraints_met"] = (len(required_classes) == 0)
-        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
+        constraints_meta.update({
+          "constraints_met": True,
+          "missing_required_classes": [],
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": False,
+        })
+        qp_audit["buckets"][bucket["label"]]["solver_failure_reason"] = "insufficient_candidates"
       items.append({
-        "risk_bucket": bucket_label,
+        "risk_bucket": bucket["label"],
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
@@ -1054,25 +1124,29 @@ def _generate_portfolios_qp(
           "constraints": constraints_meta,
         },
       })
-      continue
+    if qp_audit is not None:
+      meta["qp_audit"] = qp_audit
+    return items, meta
 
-    extra_pool = (pools.get("Equity", []) + pools.get("Alt", []))
-    for row in extra_pool:
-      if len(holdings_rows) >= max_holdings:
-        break
-      if row["Code"] in used_codes:
-        continue
-      holdings_rows.append(dict(row))
-      used_codes.add(row["Code"])
-
-    codes = [h["Code"] for h in holdings_rows]
-    returns_slice = returns_tail.reindex(columns=codes).dropna(how="any")
-    if returns_slice.empty:
+  codes = [h["Code"] for h in holdings_rows]
+  returns_slice_all = returns_tail.reindex(columns=codes).dropna(how="any")
+  if returns_slice_all.empty:
+    for bucket in _bucket_bounds():
+      constraints_meta = {
+        "required_classes": required_classes,
+        "relaxed_classes": relaxed_classes,
+        "feasible_before": feasible_before,
+      }
       if debug:
-        constraints_meta["constraints_met"] = (len(required_classes) == 0)
-        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
+        constraints_meta.update({
+          "constraints_met": False,
+          "missing_required_classes": list(required_classes),
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": False,
+        })
+        qp_audit["buckets"][bucket["label"]]["solver_failure_reason"] = "missing_covariance"
       items.append({
-        "risk_bucket": bucket_label,
+        "risk_bucket": bucket["label"],
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
@@ -1081,15 +1155,28 @@ def _generate_portfolios_qp(
           "constraints": constraints_meta,
         },
       })
-      continue
+    if qp_audit is not None:
+      meta["qp_audit"] = qp_audit
+    return items, meta
 
-    sigma = returns_slice.cov().values
-    if np.isnan(sigma).any():
+  sigma = returns_slice_all.cov().values
+  if np.isnan(sigma).any():
+    for bucket in _bucket_bounds():
+      constraints_meta = {
+        "required_classes": required_classes,
+        "relaxed_classes": relaxed_classes,
+        "feasible_before": feasible_before,
+      }
       if debug:
-        constraints_meta["constraints_met"] = (len(required_classes) == 0)
-        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
+        constraints_meta.update({
+          "constraints_met": False,
+          "missing_required_classes": list(required_classes),
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": False,
+        })
+        qp_audit["buckets"][bucket["label"]]["solver_failure_reason"] = "missing_covariance"
       items.append({
-        "risk_bucket": bucket_label,
+        "risk_bucket": bucket["label"],
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
@@ -1098,11 +1185,25 @@ def _generate_portfolios_qp(
           "constraints": constraints_meta,
         },
       })
-      continue
-    sigma = (sigma + sigma.T) / 2
-    sigma = sigma + np.eye(len(codes)) * 1e-8
+    if qp_audit is not None:
+      meta["qp_audit"] = qp_audit
+    return items, meta
 
-    mu = np.array([float(h["return_6m"]) for h in holdings_rows], dtype=float)
+  sigma = (sigma + sigma.T) / 2
+  sigma = sigma + np.eye(len(codes)) * 1e-8
+  mu = np.array([float(h.get("sharpe_window", 0.0)) for h in holdings_rows], dtype=float)
+  upper_bounds = np.array(
+    [0.4 if h["asset_class"] == "CashLike" else 0.3 for h in holdings_rows],
+    dtype=float,
+  )
+
+  for bucket in _bucket_bounds():
+    bucket_label = bucket["label"]
+    constraints_meta = {
+      "required_classes": required_classes,
+      "relaxed_classes": relaxed_classes,
+      "feasible_before": feasible_before,
+    }
 
     gamma = 1.0
     best_weights = None
@@ -1110,10 +1211,12 @@ def _generate_portfolios_qp(
     best_gamma = None
     gamma_low = 1e-4
     gamma_high = 1e4
+    solver_failure_reason = None
 
-    for _ in range(12):
-      weights = _qp_solve_weights(mu, sigma, gamma)
+    for _ in range(16):
+      weights = _qp_solve_weights(mu, sigma, gamma, upper_bounds=upper_bounds)
       if weights is None:
+        solver_failure_reason = "solver_failed"
         break
       weights = _normalize_weights(weights)
       risk_pct = _portfolio_risk_pct(weights, sigma)
@@ -1121,98 +1224,147 @@ def _generate_portfolios_qp(
       best_risk = risk_pct
       best_gamma = gamma
       if risk_pct is None:
+        solver_failure_reason = "invalid_risk"
         break
       if _risk_in_bucket(risk_pct, bucket):
         break
-      if bucket["max"] is None:
-        if risk_pct < float(bucket["min"]):
-          gamma_high = gamma
-          gamma = (gamma_low + gamma) / 2
-        else:
-          gamma_low = gamma
-          gamma = (gamma + gamma_high) / 2
+      if risk_pct < float(bucket["min"]):
+        gamma_high = gamma
+        gamma = (gamma_low + gamma) / 2
       else:
-        if risk_pct < float(bucket["min"]):
-          gamma_high = gamma
-          gamma = (gamma_low + gamma) / 2
-        else:
-          gamma_low = gamma
-          gamma = (gamma + gamma_high) / 2
+        gamma_low = gamma
+        gamma = (gamma + gamma_high) / 2
 
     if best_weights is None:
       if debug:
-        constraints_meta["constraints_met"] = (len(required_classes) == 0)
-        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
+        constraints_meta.update({
+          "constraints_met": False,
+          "missing_required_classes": list(required_classes),
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": False,
+        })
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
-        "error": "solver_failed",
+        "error": solver_failure_reason or "solver_failed",
         "meta": {
+          "gamma": best_gamma,
+          "within_bucket": False,
+          "lo": bucket["min"],
+          "hi": bucket["max"],
+          "constraints": constraints_meta,
+        },
+      })
+      if debug:
+        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = solver_failure_reason or "solver_failed"
+      continue
+
+    selected_indices, display_truncated = _select_qp_holdings_topk(
+      holdings_rows,
+      best_weights,
+      required_classes,
+      max_holdings=max_holdings,
+      min_weight=min_weight,
+    )
+    if not selected_indices:
+      if debug:
+        constraints_meta.update({
+          "constraints_met": False,
+          "missing_required_classes": list(required_classes),
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": False,
+        })
+        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_empty"
+      items.append({
+        "risk_bucket": bucket_label,
+        "risk_pct": None,
+        "return_6m": None,
+        "holdings": [],
+        "error": "postprocess_empty",
+        "meta": {
+          "gamma": best_gamma,
+          "within_bucket": False,
+          "lo": bucket["min"],
+          "hi": bucket["max"],
           "constraints": constraints_meta,
         },
       })
       continue
 
-    # Output sanitation: drop tiny/zero weights and renormalize remaining to 100%.
-    cleaned_indices = [idx for idx, weight in enumerate(best_weights.tolist()) if float(weight) > 1e-6]
-    if not cleaned_indices:
+    selected_weights = _normalize_weights(best_weights[selected_indices])
+    selected_rows = [holdings_rows[idx] for idx in selected_indices]
+    lower_bounds = np.full(len(selected_rows), min_weight, dtype=float)
+    upper_selected = np.array(
+      [0.4 if h["asset_class"] == "CashLike" else 0.3 for h in selected_rows],
+      dtype=float,
+    )
+    projected = _project_weights_with_bounds(selected_weights, lower_bounds, upper_selected)
+    if projected is None:
+      # Policy point: no extra implicit fallback when min/max bounds are infeasible after topK.
       if debug:
-        constraints_meta["constraints_met"] = (len(required_classes) == 0)
-        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
+        constraints_meta.update({
+          "constraints_met": False,
+          "missing_required_classes": list(required_classes),
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": bool(display_truncated),
+        })
+        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_infeasible"
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
-        "error": "solver_failed",
+        "error": "postprocess_infeasible",
         "meta": {
+          "gamma": best_gamma,
+          "within_bucket": False,
+          "lo": bucket["min"],
+          "hi": bucket["max"],
           "constraints": constraints_meta,
         },
       })
       continue
-    cleaned_weights = _normalize_weights(best_weights[cleaned_indices])
-    cleaned_holdings_rows = [holdings_rows[idx] for idx in cleaned_indices]
-    sigma_clean = sigma[np.ix_(cleaned_indices, cleaned_indices)]
-    cleaned_risk = _portfolio_risk_pct(cleaned_weights, sigma_clean)
 
-    weights_pct = _format_weight_percentages(cleaned_weights, decimals=2)
-    positive_pairs = [
-      (holding, weight_pct)
-      for holding, weight_pct in zip(cleaned_holdings_rows, weights_pct)
-      if float(weight_pct) > 0
-    ]
-    if not positive_pairs:
+    positive_idx = [idx for idx, weight in enumerate(projected.tolist()) if float(weight) > 1e-6]
+    if not positive_idx:
       if debug:
-        constraints_meta["constraints_met"] = (len(required_classes) == 0)
-        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
+        constraints_meta.update({
+          "constraints_met": False,
+          "missing_required_classes": list(required_classes),
+          "holdings_display_limit": int(max_holdings),
+          "holdings_display_truncated": bool(display_truncated),
+        })
+        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_zero"
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
-        "error": "solver_failed",
+        "error": "postprocess_zero",
         "meta": {
+          "gamma": best_gamma,
+          "within_bucket": False,
+          "lo": bucket["min"],
+          "hi": bucket["max"],
           "constraints": constraints_meta,
         },
       })
       continue
-    if len(positive_pairs) != len(cleaned_holdings_rows):
-      cleaned_holdings_rows = [holding for holding, _ in positive_pairs]
-      cleaned_weights = _normalize_weights(np.array([float(weight_pct) for _, weight_pct in positive_pairs], dtype=float))
-      weights_pct = _format_weight_percentages(cleaned_weights, decimals=2)
-    if debug:
-      final_asset_classes = {str(holding.get("asset_class")) for holding in cleaned_holdings_rows}
-      missing_required_classes = [asset_class for asset_class in required_classes if asset_class not in final_asset_classes]
-      constraints_meta["missing_required_classes"] = missing_required_classes
-      constraints_meta["constraints_met"] = (len(missing_required_classes) == 0)
-      constraints_meta["holdings_display_limit"] = int(max_holdings)
-      constraints_meta["holdings_display_truncated"] = bool(len(cleaned_holdings_rows) > int(max_holdings))
+
+    final_weights = _normalize_weights(projected[positive_idx])
+    final_rows = [selected_rows[idx] for idx in positive_idx]
+    weights_pct = _format_weight_percentages(final_weights, decimals=2)
+    final_classes = {h["asset_class"] for h in final_rows}
+    missing_required_classes = [asset_class for asset_class in required_classes if asset_class not in final_classes]
+    constraints_met = len(missing_required_classes) == 0
 
     holdings_output = []
     total_return = 0.0
-    for holding, weight_pct in zip(cleaned_holdings_rows, weights_pct):
+    for holding, weight_pct in zip(final_rows, weights_pct):
+      if float(weight_pct) <= 0:
+        continue
       total_return += (weight_pct / 100) * float(holding["return_6m"])
       holdings_output.append({
         "Code": holding["Code"],
@@ -1220,17 +1372,33 @@ def _generate_portfolios_qp(
         "weight": float(weight_pct),
         "asset_class": holding["asset_class"],
       })
-
     holdings_output = sorted(holdings_output, key=lambda h: (-h["weight"], h["Code"]))
+
+    final_codes = [h["Code"] for h in final_rows]
+    final_sigma = sigma[np.ix_([codes.index(code) for code in final_codes], [codes.index(code) for code in final_codes])]
+    final_risk = _portfolio_risk_pct(final_weights, final_sigma)
+    final_sharpe = _compute_portfolio_sharpe_from_returns(returns_slice_all, final_codes, final_weights)
+
+    if debug:
+      constraints_meta.update({
+        "constraints_met": constraints_met,
+        "missing_required_classes": missing_required_classes,
+        "holdings_display_limit": int(max_holdings),
+        "holdings_display_truncated": bool(display_truncated),
+      })
+      qp_audit["buckets"][bucket_label]["solver_failure_reason"] = None
+      qp_audit["buckets"][bucket_label]["S5_portfolios_produced"] = 1
 
     items.append({
       "risk_bucket": bucket_label,
-      "risk_pct": cleaned_risk,
+      "risk_pct": final_risk,
       "return_6m": total_return,
+      "sharpe_120d": final_sharpe,
+      "sharpe_window": final_sharpe,
       "holdings": holdings_output,
       "meta": {
         "gamma": best_gamma,
-        "within_bucket": _risk_in_bucket(cleaned_risk, bucket) if cleaned_risk is not None else False,
+        "within_bucket": _risk_in_bucket(final_risk, bucket) if final_risk is not None else False,
         "lo": bucket["min"],
         "hi": bucket["max"],
         "constraints": constraints_meta,
@@ -1240,8 +1408,10 @@ def _generate_portfolios_qp(
   if qp_audit is not None:
     for item in items:
       label = item.get("risk_bucket")
-      if label in qp_audit["buckets"]:
-        qp_audit["buckets"][label]["S5_portfolios_produced"] = int(0 if item.get("error") else 1)
+      if label in qp_audit["buckets"] and item.get("error"):
+        qp_audit["buckets"][label]["S5_portfolios_produced"] = 0
+        if qp_audit["buckets"][label]["solver_failure_reason"] is None:
+          qp_audit["buckets"][label]["solver_failure_reason"] = str(item.get("error"))
     meta["qp_audit"] = qp_audit
 
   return items, meta
@@ -1682,12 +1852,7 @@ def generate_portfolios(
   default_config = {
     "sample_count": 1000,
     "sample_count_by_bucket": {},
-    "topN_by_class": {
-      "Equity": 25,
-      "Alt": 20,
-      "Bond": 20,
-      "CashLike": 10,
-    },
+    "topN_by_class": 20,
   }
   if config:
     default_config.update(config)
@@ -1717,6 +1882,7 @@ def generate_portfolios(
   if strategy == "sampled":
     items, meta = _generate_portfolios_sampled(metrics, default_config, returns_tail, score_mode)
   elif strategy == "qp":
+    score_mode = "sharpe"
     items, meta = _generate_portfolios_qp(
       metrics,
       default_config,
@@ -1738,6 +1904,8 @@ def generate_portfolios(
     "return_120d_unit": "cumulative",
     "sharpe_120d_unit": "annualized",
     "window_days": int(CONFIG["window_days"]),
+    "window_weeks": 52,
+    "sharpe_window_days": int(CONFIG["window_days"]),
     "score_mode": score_mode,
   }
   if meta is None:
@@ -1792,23 +1960,25 @@ def get_portfolios(
     buckets = audit.get("buckets") or {}
     counts = {
       "S0_universe": int(audit.get("S0_universe", 0)),
-      "S1_bucket": {label: int(data.get("S1_bucket", 0)) for label, data in buckets.items()},
+      "S1_candidate_topN": {label: (data.get("S1_candidate_topN") or {}) for label, data in buckets.items()},
       "S2_metrics_non_nan": {label: int(data.get("S2_metrics_non_nan", 0)) for label, data in buckets.items()},
       "S3_asset_class": {
         label: {
           "known": int((data.get("S3_asset_class") or {}).get("known", 0)),
           "unknown": int((data.get("S3_asset_class") or {}).get("unknown", 0)),
+          "by_class": ((data.get("S3_asset_class") or {}).get("by_class") or {}),
         }
         for label, data in buckets.items()
       },
       "S4_class_min_feasible": {label: int(data.get("S4_class_min_feasible", 0)) for label, data in buckets.items()},
       "S5_portfolios_produced": {label: int(data.get("S5_portfolios_produced", 0)) for label, data in buckets.items()},
+      "solver_failure_reason": {label: data.get("solver_failure_reason") for label, data in buckets.items()},
     }
 
   payload["debug"] = {
     "debug_code": debug_code,
     "note": "B0.5 audit enabled",
-    # Stage meanings: S0 universe -> S1 bucket split -> S2 metric-valid rows -> S3 class-known rows -> S4 class-min feasible -> S5 portfolio produced.
+    # Stage meanings: S0 universe -> S1 topN candidate pools(by class) -> S2 metric-valid candidates -> S3 class counts -> S4 class-min feasibility -> S5 bucket portfolio produced.
     "counts": counts,
     "timing_ms": {
       "total": round((time.perf_counter() - t0) * 1000, 2),
