@@ -881,6 +881,7 @@ def _generate_portfolios_qp(
   config: Dict[str, object],
   returns_tail: pd.DataFrame | None,
   score_mode: str,
+  debug: bool = False,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
   try:
     import cvxpy  # noqa: F401
@@ -895,6 +896,40 @@ def _generate_portfolios_qp(
     "solver_available": solver_available,
     "score_mode": score_mode,
   }
+  qp_audit = None
+  if debug:
+    stage0_df = metrics.dropna(subset=["Code", "Name"]).copy()
+    qp_audit = {
+      "S0_universe": int(len(stage0_df)),
+      "buckets": {},
+    }
+    for bucket in _bucket_bounds():
+      label = bucket["label"]
+      s1_df = stage0_df[stage0_df["risk_bucket"] == label].copy()
+      s2_df = s1_df.dropna(subset=["return_6m", "risk_pct", "sharpe_120d"]).copy()
+      class_counts = {asset_class: 0 for asset_class in ASSET_CLASSES}
+      unknown_count = 0
+      if not s2_df.empty:
+        s2_df["asset_class"] = s2_df["Name"].apply(classify_asset_class)
+        known_mask = s2_df["asset_class"].isin(ASSET_CLASSES)
+        unknown_count = int((~known_mask).sum())
+        s3_df = s2_df.loc[known_mask]
+        class_counts = {
+          asset_class: int((s3_df["asset_class"] == asset_class).sum())
+          for asset_class in ASSET_CLASSES
+        }
+      feasible = all(class_counts[asset_class] >= 1 for asset_class in ASSET_CLASSES)
+      qp_audit["buckets"][label] = {
+        "S1_bucket": int(len(s1_df)),
+        "S2_metrics_non_nan": int(len(s2_df)),
+        "S3_asset_class": {
+          "known": int(sum(class_counts.values())),
+          "unknown": int(unknown_count),
+          "by_class": class_counts,
+        },
+        "S4_class_min_feasible": int(1 if feasible else 0),
+        "S5_portfolios_produced": 0,
+      }
 
   pools = _build_candidate_pools(metrics, config)
   meta["universe_counts"] = {key: len(value) for key, value in pools.items()}
@@ -908,6 +943,8 @@ def _generate_portfolios_qp(
         "holdings": [],
         "error": "insufficient_candidates",
       })
+    if qp_audit is not None:
+      meta["qp_audit"] = qp_audit
     return items, meta
 
   if not solver_available:
@@ -920,6 +957,8 @@ def _generate_portfolios_qp(
         "holdings": [],
         "error": "missing_solver",
       })
+    if qp_audit is not None:
+      meta["qp_audit"] = qp_audit
     return items, meta
 
   if returns_tail is None or returns_tail.empty:
@@ -932,6 +971,8 @@ def _generate_portfolios_qp(
         "holdings": [],
         "error": "missing_covariance",
       })
+    if qp_audit is not None:
+      meta["qp_audit"] = qp_audit
     return items, meta
 
   items: List[Dict[str, object]] = []
@@ -1068,6 +1109,13 @@ def _generate_portfolios_qp(
         "hi": bucket["max"],
       },
     })
+
+  if qp_audit is not None:
+    for item in items:
+      label = item.get("risk_bucket")
+      if label in qp_audit["buckets"]:
+        qp_audit["buckets"][label]["S5_portfolios_produced"] = int(0 if item.get("error") else 1)
+    meta["qp_audit"] = qp_audit
 
   return items, meta
 
@@ -1496,6 +1544,8 @@ def generate_portfolios(
   config: Dict[str, object] | None = None,
   returns_tail: pd.DataFrame | None = None,
   score_mode: str = "sharpe",
+  debug: int | bool = False,
+  debug_code: str | None = None,
 ) -> Dict[str, object]:
   if isinstance(items, list):
     metrics = pd.DataFrame.from_records(items)
@@ -1540,7 +1590,13 @@ def generate_portfolios(
   if strategy == "sampled":
     items, meta = _generate_portfolios_sampled(metrics, default_config, returns_tail, score_mode)
   elif strategy == "qp":
-    items, meta = _generate_portfolios_qp(metrics, default_config, returns_tail, score_mode)
+    items, meta = _generate_portfolios_qp(
+      metrics,
+      default_config,
+      returns_tail,
+      score_mode,
+      debug=bool(debug),
+    )
   elif strategy == "grid":
     items, meta = _generate_portfolios_grid(metrics, default_config)
   elif strategy == "bucket_fallback":
@@ -1579,13 +1635,59 @@ def format_portfolios(
   return payload
 
 
-def get_portfolios(strategy: str = "sampled", score: str = "sharpe") -> Dict[str, object]:
+def get_portfolios(
+  strategy: str = "sampled",
+  score: str = "sharpe",
+  debug: int | bool = False,
+  debug_code: str | None = None,
+) -> Dict[str, object]:
   _get_cache()
   metrics = _CACHE["metrics"]
   returns_tail = _CACHE.get("returns_tail")
   if metrics is None:
     metrics = pd.DataFrame()
-  return generate_portfolios(metrics, strategy=strategy, returns_tail=returns_tail, score_mode=score)
+  debug_enabled = bool(debug)
+  t0 = time.perf_counter() if debug_enabled else 0.0
+  payload = generate_portfolios(
+    metrics,
+    strategy=strategy,
+    returns_tail=returns_tail,
+    score_mode=score,
+    debug=debug_enabled,
+    debug_code=debug_code,
+  )
+  if not debug_enabled:
+    return payload
+
+  counts: Dict[str, object] = {}
+  if strategy == "qp":
+    audit = (payload.get("meta") or {}).get("qp_audit") or {}
+    buckets = audit.get("buckets") or {}
+    counts = {
+      "S0_universe": int(audit.get("S0_universe", 0)),
+      "S1_bucket": {label: int(data.get("S1_bucket", 0)) for label, data in buckets.items()},
+      "S2_metrics_non_nan": {label: int(data.get("S2_metrics_non_nan", 0)) for label, data in buckets.items()},
+      "S3_asset_class": {
+        label: {
+          "known": int((data.get("S3_asset_class") or {}).get("known", 0)),
+          "unknown": int((data.get("S3_asset_class") or {}).get("unknown", 0)),
+        }
+        for label, data in buckets.items()
+      },
+      "S4_class_min_feasible": {label: int(data.get("S4_class_min_feasible", 0)) for label, data in buckets.items()},
+      "S5_portfolios_produced": {label: int(data.get("S5_portfolios_produced", 0)) for label, data in buckets.items()},
+    }
+
+  payload["debug"] = {
+    "debug_code": debug_code,
+    "note": "B0.5 audit enabled",
+    # Stage meanings: S0 universe -> S1 bucket split -> S2 metric-valid rows -> S3 class-known rows -> S4 class-min feasible -> S5 portfolio produced.
+    "counts": counts,
+    "timing_ms": {
+      "total": round((time.perf_counter() - t0) * 1000, 2),
+    },
+  }
+  return payload
 
 
 def get_price_series(code: str, days: int = 120) -> Dict[str, object]:
