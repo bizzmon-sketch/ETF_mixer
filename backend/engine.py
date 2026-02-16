@@ -1018,6 +1018,13 @@ def _generate_portfolios_qp(
       "relaxed_classes": relaxed_classes,
       "feasible_before": feasible_before,
     }
+    if debug:
+      constraints_meta.update({
+        "constraints_met": False,
+        "missing_required_classes": list(required_classes),
+        "holdings_display_limit": int(max_holdings),
+        "holdings_display_truncated": False,
+      })
 
     holdings_rows: List[Dict[str, object]] = []
     used_codes: set[str] = set()
@@ -1034,6 +1041,9 @@ def _generate_portfolios_qp(
       used_codes.add(top["Code"])
 
     if not holdings_rows:
+      if debug:
+        constraints_meta["constraints_met"] = (len(required_classes) == 0)
+        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1058,6 +1068,9 @@ def _generate_portfolios_qp(
     codes = [h["Code"] for h in holdings_rows]
     returns_slice = returns_tail.reindex(columns=codes).dropna(how="any")
     if returns_slice.empty:
+      if debug:
+        constraints_meta["constraints_met"] = (len(required_classes) == 0)
+        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1072,6 +1085,9 @@ def _generate_portfolios_qp(
 
     sigma = returns_slice.cov().values
     if np.isnan(sigma).any():
+      if debug:
+        constraints_meta["constraints_met"] = (len(required_classes) == 0)
+        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1124,6 +1140,9 @@ def _generate_portfolios_qp(
           gamma = (gamma + gamma_high) / 2
 
     if best_weights is None:
+      if debug:
+        constraints_meta["constraints_met"] = (len(required_classes) == 0)
+        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1139,6 +1158,9 @@ def _generate_portfolios_qp(
     # Output sanitation: drop tiny/zero weights and renormalize remaining to 100%.
     cleaned_indices = [idx for idx, weight in enumerate(best_weights.tolist()) if float(weight) > 1e-6]
     if not cleaned_indices:
+      if debug:
+        constraints_meta["constraints_met"] = (len(required_classes) == 0)
+        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1162,6 +1184,9 @@ def _generate_portfolios_qp(
       if float(weight_pct) > 0
     ]
     if not positive_pairs:
+      if debug:
+        constraints_meta["constraints_met"] = (len(required_classes) == 0)
+        constraints_meta["missing_required_classes"] = [] if constraints_meta["constraints_met"] else list(required_classes)
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1177,6 +1202,13 @@ def _generate_portfolios_qp(
       cleaned_holdings_rows = [holding for holding, _ in positive_pairs]
       cleaned_weights = _normalize_weights(np.array([float(weight_pct) for _, weight_pct in positive_pairs], dtype=float))
       weights_pct = _format_weight_percentages(cleaned_weights, decimals=2)
+    if debug:
+      final_asset_classes = {str(holding.get("asset_class")) for holding in cleaned_holdings_rows}
+      missing_required_classes = [asset_class for asset_class in required_classes if asset_class not in final_asset_classes]
+      constraints_meta["missing_required_classes"] = missing_required_classes
+      constraints_meta["constraints_met"] = (len(missing_required_classes) == 0)
+      constraints_meta["holdings_display_limit"] = int(max_holdings)
+      constraints_meta["holdings_display_truncated"] = bool(len(cleaned_holdings_rows) > int(max_holdings))
 
     holdings_output = []
     total_return = 0.0
