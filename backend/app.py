@@ -103,13 +103,28 @@ def prices():
 def portfolios():
   strategy = request.args.get("strategy", "sampled")
   score = request.args.get("score", "sharpe")
+  # `debug=1` forces a live compute path so debug payloads are never stale.
+  debug_raw = (request.args.get("debug", "0") or "0").strip().lower()
+  debug = debug_raw in ("1", "true", "yes", "y", "on")
+  debug_code = (request.args.get("debug_code", "") or "").strip()
+  if not debug_code:
+    debug_code = None
+
   cache_path = os.path.join(CACHE_DIR, f"portfolios_{strategy}_{score}.json")
-  cached = _read_json_cache(cache_path)
-  if cached is not None:
-    return jsonify(cached)
-  payload = engine.get_portfolios(strategy=strategy, score=score)
+  if not debug:
+    cached = _read_json_cache(cache_path)
+    if cached is not None:
+      return jsonify(cached)
+
+  # Forward debug kwargs when supported; keep backward compatibility otherwise.
+  kwargs = {"debug": int(debug), "debug_code": debug_code}
+  try:
+    payload = engine.get_portfolios(strategy=strategy, score=score, **kwargs)
+  except TypeError:
+    payload = engine.get_portfolios(strategy=strategy, score=score)
   payload = _attach_metadata(payload, "runtime")
-  _write_json_atomic(cache_path, payload)
+  if not debug:
+    _write_json_atomic(cache_path, payload)
   return jsonify(payload)
 
 
