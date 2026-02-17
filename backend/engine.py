@@ -973,6 +973,8 @@ def _qp_solve_weights(
     diag["sigma_min_eig"] = None
     diag["sigma_eig_error"] = str(exc)
   diag["sigma_jitter"] = _to_json_float(jitter)
+  sigma_qp = cp.psd_wrap(sigma_work)
+  diag["sigma_psd_wrapped"] = True
 
   if solver:
     solvers_to_try = [str(solver)]
@@ -992,7 +994,7 @@ def _qp_solve_weights(
       "prob_value": None,
     }
     w = cp.Variable(n, nonneg=True)
-    objective = cp.Maximize(mu_arr @ w - float(gamma) * cp.quad_form(w, sigma_work))
+    objective = cp.Maximize(mu_arr @ w - float(gamma) * cp.quad_form(w, sigma_qp))
     constraints = [cp.sum(w) == 1]
     if upper_arr is not None:
       constraints.append(w <= upper_arr)
