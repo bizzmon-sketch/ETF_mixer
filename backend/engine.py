@@ -6,7 +6,7 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 import hashlib
 import random
 
@@ -834,36 +834,204 @@ def _format_weight_percentages(weights: np.ndarray, decimals: int = 2) -> List[f
   return [float(value) for value in percents]
 
 
+def _to_json_float(value: object) -> float | None:
+  try:
+    v = float(value)
+  except Exception:
+    return None
+  if not np.isfinite(v):
+    return None
+  return float(v)
+
+
+def _to_json_bool(value: object) -> bool:
+  try:
+    return bool(value)
+  except Exception:
+    return False
+
+
+def _fmt_float(value: object, digits: int = 6) -> str:
+  v = _to_json_float(value)
+  if v is None:
+    return "na"
+  return f"{v:.{digits}f}"
+
+
+def _qp_fail_reason_from_status(status: str | None) -> str:
+  if status is None:
+    return "no_solution"
+  status_value = str(status).lower()
+  if status_value in ("infeasible", "infeasible_inaccurate"):
+    return "infeasible"
+  if status_value in ("unbounded", "unbounded_inaccurate"):
+    return "unbounded"
+  if status_value in ("optimal", "optimal_inaccurate"):
+    return "no_solution"
+  return "unknown_status"
+
+
+def _qp_is_dcp_error(message: str) -> bool:
+  msg = (message or "").lower()
+  return "dcp" in msg or "not dcp" in msg
+
+
+def _qp_is_psd_issue(message: str) -> bool:
+  msg = (message or "").lower()
+  return "psd" in msg or "positive semidefinite" in msg or "quad_form" in msg
+
+
+def _qp_default_solvers(cp_module: Any) -> List[str]:
+  order = ["ECOS", "OSQP", "SCS", "CLARABEL"]
+  try:
+    installed = set(cp_module.installed_solvers())
+  except Exception:
+    installed = set()
+  if not installed:
+    return ["ECOS", "OSQP", "SCS"]
+  return [solver_name for solver_name in order if solver_name in installed]
+
+
 def _qp_solve_weights(
   mu: np.ndarray,
   sigma: np.ndarray,
   gamma: float,
   upper_bounds: np.ndarray | None = None,
   solver: str | None = None,
-) -> np.ndarray | None:
+) -> Tuple[np.ndarray | None, Dict[str, object]]:
+  diag: Dict[str, object] = {
+    "solver_requested": solver,
+    "solver_mode": "explicit" if solver else "default_fallback",
+    "chosen_solver": None,
+    "prob.status": None,
+    "prob.value": None,
+    "exception": None,
+    "solver_attempts": [],
+    "fail_reason": None,
+  }
   try:
     import cvxpy as cp
-  except Exception:
-    return None
-  n = len(mu)
+  except Exception as exc:
+    diag["exception"] = str(exc)
+    diag["fail_reason"] = "exception"
+    return None, diag
+
+  mu_arr = np.array(mu, dtype=float).flatten()
+  sigma_arr = np.array(sigma, dtype=float)
+  n = int(len(mu_arr))
+  diag["n"] = n
+  diag["gamma"] = _to_json_float(gamma)
+  diag["has_upper_bounds"] = _to_json_bool(upper_bounds is not None)
+  if upper_bounds is not None:
+    upper_arr = np.array(upper_bounds, dtype=float).flatten()
+  else:
+    upper_arr = None
+  diag["sum_upper_bounds"] = _to_json_float(np.sum(upper_arr)) if upper_arr is not None and upper_arr.size else None
+  diag["mu_min"] = _to_json_float(np.min(mu_arr)) if mu_arr.size else None
+  diag["mu_max"] = _to_json_float(np.max(mu_arr)) if mu_arr.size else None
+  sigma_diag = np.diag(sigma_arr) if sigma_arr.ndim == 2 and sigma_arr.shape[0] > 0 else np.array([], dtype=float)
+  diag["sigma_diag_min"] = _to_json_float(np.min(sigma_diag)) if sigma_diag.size else None
+  diag["sigma_diag_max"] = _to_json_float(np.max(sigma_diag)) if sigma_diag.size else None
+  diag["mu_has_nan"] = bool(np.isnan(mu_arr).any()) if mu_arr.size else False
+  diag["mu_has_inf"] = bool(np.isinf(mu_arr).any()) if mu_arr.size else False
+  diag["sigma_has_nan"] = bool(np.isnan(sigma_arr).any()) if sigma_arr.size else False
+  diag["sigma_has_inf"] = bool(np.isinf(sigma_arr).any()) if sigma_arr.size else False
+  diag["upper_bounds_has_nan"] = bool(np.isnan(upper_arr).any()) if upper_arr is not None and upper_arr.size else False
+  diag["upper_bounds_has_inf"] = bool(np.isinf(upper_arr).any()) if upper_arr is not None and upper_arr.size else False
+
   if n == 0:
-    return None
-  w = cp.Variable(n, nonneg=True)
-  objective = cp.Maximize(mu @ w - gamma * cp.quad_form(w, sigma))
-  constraints = [cp.sum(w) == 1]
-  if upper_bounds is not None and len(upper_bounds) == n:
-    constraints.append(w <= np.array(upper_bounds, dtype=float))
-  prob = cp.Problem(objective, constraints)
+    diag["fail_reason"] = "no_solution"
+    return None, diag
+  if sigma_arr.ndim != 2 or sigma_arr.shape[0] != n or sigma_arr.shape[1] != n:
+    diag["fail_reason"] = "shape_error"
+    return None, diag
+  if upper_arr is not None and upper_arr.size != n:
+    diag["fail_reason"] = "shape_error"
+    return None, diag
+  if (
+    diag["mu_has_nan"]
+    or diag["mu_has_inf"]
+    or diag["sigma_has_nan"]
+    or diag["sigma_has_inf"]
+    or diag["upper_bounds_has_nan"]
+    or diag["upper_bounds_has_inf"]
+  ):
+    diag["fail_reason"] = "nan_inf"
+    return None, diag
+
+  sigma_work = (sigma_arr + sigma_arr.T) / 2
+  diag["sigma_symmetrized"] = True
+  jitter = 0.0
   try:
-    if solver:
-      prob.solve(solver=solver, warm_start=True)
-    else:
-      prob.solve(warm_start=True)
-  except Exception:
-    return None
-  if w.value is None:
-    return None
-  return np.array(w.value, dtype=float).flatten()
+    eigvals = np.linalg.eigvalsh(sigma_work)
+    min_eig = float(np.min(eigvals)) if eigvals.size else 0.0
+    diag["sigma_min_eig"] = _to_json_float(min_eig)
+    if min_eig < -1e-10:
+      jitter = float(abs(min_eig) + 1e-10)
+      sigma_work = sigma_work + np.eye(n) * jitter
+  except Exception as exc:
+    diag["sigma_min_eig"] = None
+    diag["sigma_eig_error"] = str(exc)
+  diag["sigma_jitter"] = _to_json_float(jitter)
+  sigma_qp = cp.psd_wrap(sigma_work)
+  diag["sigma_psd_wrapped"] = True
+
+  if solver:
+    solvers_to_try = [str(solver)]
+  else:
+    solvers_to_try = _qp_default_solvers(cp)
+  diag["solvers_to_try"] = list(solvers_to_try)
+  if not solvers_to_try:
+    diag["fail_reason"] = "no_solver"
+    return None, diag
+
+  last_fail_reason: str | None = None
+  for solver_name in solvers_to_try:
+    attempt: Dict[str, object] = {
+      "solver_name": solver_name,
+      "status": None,
+      "fail_reason": None,
+      "prob_value": None,
+    }
+    w = cp.Variable(n, nonneg=True)
+    objective = cp.Maximize(mu_arr @ w - float(gamma) * cp.quad_form(w, sigma_qp))
+    constraints = [cp.sum(w) == 1]
+    if upper_arr is not None:
+      constraints.append(w <= upper_arr)
+    prob = cp.Problem(objective, constraints)
+    try:
+      prob.solve(solver=solver_name, warm_start=True)
+    except Exception as exc:
+      message = str(exc)
+      attempt["exception"] = message
+      attempt["fail_reason"] = "dcp_error" if _qp_is_dcp_error(message) else ("psd_issue" if _qp_is_psd_issue(message) else "exception")
+      diag["exception"] = message
+      diag["solver_attempts"].append(attempt)
+      last_fail_reason = str(attempt["fail_reason"])
+      continue
+    status = str(prob.status) if prob.status is not None else None
+    attempt["status"] = status
+    attempt["prob_value"] = _to_json_float(prob.value)
+    diag["prob.status"] = status
+    diag["prob.value"] = _to_json_float(prob.value)
+    if w.value is None:
+      attempt["fail_reason"] = _qp_fail_reason_from_status(status)
+      diag["solver_attempts"].append(attempt)
+      last_fail_reason = str(attempt["fail_reason"])
+      continue
+    weights = np.array(w.value, dtype=float).flatten()
+    if not np.isfinite(weights).all():
+      attempt["fail_reason"] = "nan_inf"
+      diag["solver_attempts"].append(attempt)
+      last_fail_reason = str(attempt["fail_reason"])
+      continue
+    diag["chosen_solver"] = solver_name
+    diag["solver_attempts"].append(attempt)
+    diag["fail_reason"] = None
+    return weights, diag
+
+  diag["fail_reason"] = last_fail_reason or _qp_fail_reason_from_status(diag.get("prob.status")) or "no_solution"
+  return None, diag
 
 
 def _portfolio_risk_pct(weights: np.ndarray, sigma: np.ndarray) -> float | None:
@@ -981,9 +1149,10 @@ def _generate_portfolios_qp(
   debug: bool = False,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
   try:
-    import cvxpy  # noqa: F401
+    import cvxpy
     solver_available = True
   except Exception:
+    cvxpy = None
     solver_available = False
 
   topn_config = config.get("topN_by_class", 20)
@@ -1035,6 +1204,8 @@ def _generate_portfolios_qp(
         "S4_class_min_feasible": int(feasible_before),
         "S5_portfolios_produced": 0,
         "solver_failure_reason": None,
+        "solver_diag": None,
+        "solver_attempts": [],
       }
 
   items: List[Dict[str, object]] = []
@@ -1160,7 +1331,8 @@ def _generate_portfolios_qp(
     return items, meta
 
   sigma = returns_slice_all.cov().values
-  if np.isnan(sigma).any():
+  sigma = (sigma + sigma.T) / 2
+  if not np.isfinite(sigma).all():
     for bucket in _bucket_bounds():
       constraints_meta = {
         "required_classes": required_classes,
@@ -1174,13 +1346,13 @@ def _generate_portfolios_qp(
           "holdings_display_limit": int(max_holdings),
           "holdings_display_truncated": False,
         })
-        qp_audit["buckets"][bucket["label"]]["solver_failure_reason"] = "missing_covariance"
+        qp_audit["buckets"][bucket["label"]]["solver_failure_reason"] = "nan_inf"
       items.append({
         "risk_bucket": bucket["label"],
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
-        "error": "missing_covariance",
+        "error": "nan_inf",
         "meta": {
           "constraints": constraints_meta,
         },
@@ -1189,13 +1361,12 @@ def _generate_portfolios_qp(
       meta["qp_audit"] = qp_audit
     return items, meta
 
-  sigma = (sigma + sigma.T) / 2
-  sigma = sigma + np.eye(len(codes)) * 1e-8
   mu = np.array([float(h.get("sharpe_window", 0.0)) for h in holdings_rows], dtype=float)
   upper_bounds = np.array(
     [0.4 if h["asset_class"] == "CashLike" else 0.3 for h in holdings_rows],
     dtype=float,
   )
+  default_solvers = _qp_default_solvers(cvxpy) if cvxpy is not None else ["ECOS", "OSQP", "SCS"]
 
   for bucket in _bucket_bounds():
     bucket_label = bucket["label"]
@@ -1212,17 +1383,45 @@ def _generate_portfolios_qp(
     gamma_low = 1e-4
     gamma_high = 1e4
     solver_failure_reason = None
+    best_solver_diag: Dict[str, object] | None = None
+    bucket_solver_attempts: List[List[object]] = []
+    last_status = None
+    chosen_solver = None
+
+    if debug:
+      logger.info(
+        "[QP] bucket=%s n=%s gamma=%s trying solvers=%s",
+        bucket_label,
+        len(mu),
+        _fmt_float(gamma, digits=6),
+        default_solvers,
+      )
 
     for _ in range(16):
-      weights = _qp_solve_weights(mu, sigma, gamma, upper_bounds=upper_bounds)
+      weights, solve_diag = _qp_solve_weights(mu, sigma, gamma, upper_bounds=upper_bounds)
+      solve_diag["gamma"] = _to_json_float(gamma)
+      attempts = solve_diag.get("solver_attempts")
+      if isinstance(attempts, list):
+        for attempt in attempts:
+          if isinstance(attempt, dict):
+            bucket_solver_attempts.append([
+              attempt.get("solver_name"),
+              attempt.get("status"),
+              attempt.get("fail_reason"),
+            ])
+      last_status = solve_diag.get("prob.status")
+      if solve_diag.get("chosen_solver"):
+        chosen_solver = solve_diag.get("chosen_solver")
       if weights is None:
-        solver_failure_reason = "solver_failed"
+        solver_failure_reason = str(solve_diag.get("fail_reason") or "solver_failed")
+        best_solver_diag = solve_diag
         break
       weights = _normalize_weights(weights)
       risk_pct = _portfolio_risk_pct(weights, sigma)
       best_weights = weights
       best_risk = risk_pct
       best_gamma = gamma
+      best_solver_diag = solve_diag
       if risk_pct is None:
         solver_failure_reason = "invalid_risk"
         break
@@ -1259,6 +1458,14 @@ def _generate_portfolios_qp(
       })
       if debug:
         qp_audit["buckets"][bucket_label]["solver_failure_reason"] = solver_failure_reason or "solver_failed"
+        qp_audit["buckets"][bucket_label]["solver_diag"] = best_solver_diag
+        qp_audit["buckets"][bucket_label]["solver_attempts"] = bucket_solver_attempts
+        logger.info(
+          "[QP] bucket=%s result=FAIL status=%s reason=%s",
+          bucket_label,
+          last_status,
+          solver_failure_reason or "solver_failed",
+        )
       continue
 
     selected_indices, display_truncated = _select_qp_holdings_topk(
@@ -1277,6 +1484,14 @@ def _generate_portfolios_qp(
           "holdings_display_truncated": False,
         })
         qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_empty"
+        qp_audit["buckets"][bucket_label]["solver_diag"] = best_solver_diag
+        qp_audit["buckets"][bucket_label]["solver_attempts"] = bucket_solver_attempts
+        logger.info(
+          "[QP] bucket=%s result=FAIL status=%s reason=%s",
+          bucket_label,
+          last_status,
+          "postprocess_empty",
+        )
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1311,6 +1526,14 @@ def _generate_portfolios_qp(
           "holdings_display_truncated": bool(display_truncated),
         })
         qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_infeasible"
+        qp_audit["buckets"][bucket_label]["solver_diag"] = best_solver_diag
+        qp_audit["buckets"][bucket_label]["solver_attempts"] = bucket_solver_attempts
+        logger.info(
+          "[QP] bucket=%s result=FAIL status=%s reason=%s",
+          bucket_label,
+          last_status,
+          "postprocess_infeasible",
+        )
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1337,6 +1560,14 @@ def _generate_portfolios_qp(
           "holdings_display_truncated": bool(display_truncated),
         })
         qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_zero"
+        qp_audit["buckets"][bucket_label]["solver_diag"] = best_solver_diag
+        qp_audit["buckets"][bucket_label]["solver_attempts"] = bucket_solver_attempts
+        logger.info(
+          "[QP] bucket=%s result=FAIL status=%s reason=%s",
+          bucket_label,
+          last_status,
+          "postprocess_zero",
+        )
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
@@ -1388,6 +1619,16 @@ def _generate_portfolios_qp(
       })
       qp_audit["buckets"][bucket_label]["solver_failure_reason"] = None
       qp_audit["buckets"][bucket_label]["S5_portfolios_produced"] = 1
+      qp_audit["buckets"][bucket_label]["solver_diag"] = best_solver_diag
+      qp_audit["buckets"][bucket_label]["solver_attempts"] = bucket_solver_attempts
+      logger.info(
+        "[QP] bucket=%s result=OK status=%s solver=%s risk=%s return=%s",
+        bucket_label,
+        best_solver_diag.get("prob.status") if isinstance(best_solver_diag, dict) else last_status,
+        chosen_solver,
+        _fmt_float(final_risk, digits=4),
+        _fmt_float(total_return, digits=6),
+      )
 
     items.append({
       "risk_bucket": bucket_label,
