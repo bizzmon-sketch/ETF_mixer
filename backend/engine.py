@@ -21,6 +21,14 @@ CONFIG = {
   "min_observations": 90,
   "trading_days_month": 21,
   "window_days": 260,
+  "analysis_freq": "daily",
+  "window_periods_by_freq": {
+    "daily": 260,
+    "weekly": 52,
+  },
+  "alignment_policy": "intersection",
+  "weekly_resample_rule": "W-FRI",
+  "cov_shrink_alpha": 0.05,
   "cache_ttl_sec": 600,
   "refresh_buffer_days": 3,
   "refresh_interval_sec": 600,
@@ -279,16 +287,121 @@ def classify_risk(risk_pct: float) -> str | None:
   return None
 
 
-def _compute_returns_tail(close: pd.DataFrame, window_days: int) -> pd.DataFrame:
+def _resolve_analysis_freq() -> str:
+  freq = str(CONFIG.get("analysis_freq", "daily")).strip().lower()
+  if freq not in ("daily", "weekly"):
+    return "daily"
+  return freq
+
+
+def _periods_per_year(freq: str) -> float:
+  return 52.0 if freq == "weekly" else 252.0
+
+
+def _scale_to_monthly(freq: str) -> float:
+  if freq == "weekly":
+    return float(np.sqrt(52.0 / 12.0))
+  return float(np.sqrt(float(CONFIG["trading_days_month"])))
+
+
+def _resolve_window_periods(freq: str) -> int:
+  by_freq = CONFIG.get("window_periods_by_freq", {})
+  if isinstance(by_freq, dict):
+    raw = by_freq.get(freq)
+    if raw is not None:
+      try:
+        value = int(raw)
+        if value > 0:
+          return value
+      except Exception:
+        pass
+  try:
+    value = int(CONFIG.get("window_days", 260))
+    if value > 0:
+      return value
+  except Exception:
+    pass
+  return 260
+
+
+def _resample_prices(close: pd.DataFrame, freq: str) -> pd.DataFrame:
+  if close is None or close.empty:
+    return pd.DataFrame()
+  if freq == "weekly":
+    rule = str(CONFIG.get("weekly_resample_rule", "W-FRI"))
+    return close.resample(rule).last().dropna(how="all")
+  return close.sort_index()
+
+
+def _align_prices_by_date_index(
+  close: pd.DataFrame,
+  codes: List[str] | None = None,
+  policy: str = "intersection",
+) -> pd.DataFrame:
+  if close is None or close.empty:
+    return pd.DataFrame()
+  out = close.copy()
+  if codes:
+    existing = [code for code in codes if code in out.columns]
+    out = out.reindex(columns=existing)
+  out = out.sort_index()
+  if out.empty:
+    return out
+  policy = str(policy or "intersection").lower()
+  if policy == "intersection":
+    return out.dropna(how="any")
+  return out.dropna(how="any")
+
+
+def _prepare_aligned_prices(
+  close: pd.DataFrame,
+  codes: List[str] | None = None,
+  freq: str | None = None,
+  policy: str | None = None,
+) -> pd.DataFrame:
+  freq_used = freq or _resolve_analysis_freq()
+  policy_used = policy or str(CONFIG.get("alignment_policy", "intersection"))
+  resampled = _resample_prices(close, freq_used)
+  return _align_prices_by_date_index(resampled, codes=codes, policy=policy_used)
+
+
+def _compute_returns_tail(close: pd.DataFrame, window_periods: int) -> pd.DataFrame:
   if close.empty:
     return pd.DataFrame()
   returns = close.pct_change().dropna(how="all")
   if returns.empty:
     return returns
-  window_days = int(window_days)
-  if window_days > 0:
-    return returns.tail(window_days)
+  window_periods = int(window_periods)
+  if window_periods > 0:
+    return returns.tail(window_periods)
   return returns
+
+
+def _apply_diagonal_shrinkage(sigma: np.ndarray, alpha: float) -> np.ndarray:
+  sigma_work = np.array(sigma, dtype=float)
+  if sigma_work.size == 0:
+    return sigma_work
+  a = float(alpha)
+  if not np.isfinite(a):
+    a = 0.0
+  a = max(0.0, min(1.0, a))
+  diag = np.diag(np.diag(sigma_work))
+  return (1.0 - a) * sigma_work + a * diag
+
+
+def _compute_returns_from_aligned_prices(
+  close_aligned: pd.DataFrame,
+  window_periods: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+  if close_aligned is None or close_aligned.empty:
+    return pd.DataFrame(), pd.DataFrame()
+  returns = close_aligned.pct_change().dropna(how="all")
+  if returns.empty:
+    return returns, returns
+  periods = int(window_periods)
+  if periods > 0:
+    return returns, returns.tail(periods)
+  return returns, returns
 
 
 def compute_metrics(
@@ -303,18 +416,29 @@ def compute_metrics(
 
   counts = close.count()
   eligible = counts[counts >= CONFIG["min_observations"]].index.tolist()
-  close = close[eligible].dropna(how="all")
-  if close.empty:
+  freq = _resolve_analysis_freq()
+  window_periods = _resolve_window_periods(freq)
+  aligned_close = _prepare_aligned_prices(
+    close.reindex(columns=eligible),
+    codes=eligible,
+    freq=freq,
+    policy=str(CONFIG.get("alignment_policy", "intersection")),
+  )
+  if aligned_close.empty:
     return pd.DataFrame(columns=[
       "Code", "Name", "return_6m", "return_120d", "sharpe_120d", "risk_6m", "risk_pct", "risk_bucket",
     ])
 
-  returns = close.pct_change().dropna(how="all")
+  returns, default_tail = _compute_returns_from_aligned_prices(aligned_close, window_periods)
+  if returns.empty:
+    return pd.DataFrame(columns=[
+      "Code", "Name", "return_6m", "return_120d", "sharpe_120d", "risk_6m", "risk_pct", "risk_bucket",
+    ])
   if returns_tail is None:
-    returns_tail = _compute_returns_tail(close, CONFIG["window_days"])
-  if not returns_tail.empty:
-    returns_tail = returns_tail.reindex(columns=eligible)
-  return_6m = (close.iloc[-1] / close.iloc[0]) - 1
+    returns_tail = default_tail
+  else:
+    returns_tail = returns_tail.reindex(columns=aligned_close.columns).dropna(how="any")
+  return_6m = (aligned_close.iloc[-1] / aligned_close.iloc[0]) - 1
   if returns_tail.empty:
     return_120d = pd.Series(index=return_6m.index, dtype=float)
     sharpe_120d = pd.Series(index=return_6m.index, dtype=float)
@@ -322,10 +446,10 @@ def compute_metrics(
     return_120d = (1 + returns_tail).prod() - 1
     returns_mean = returns_tail.mean()
     returns_std = returns_tail.std()
-    sharpe_120d = (returns_mean / returns_std) * np.sqrt(252)
+    sharpe_120d = (returns_mean / returns_std) * np.sqrt(_periods_per_year(freq))
     sharpe_120d = sharpe_120d.replace([np.inf, -np.inf], np.nan)
     sharpe_120d = sharpe_120d.where(returns_std > 0)
-  vol_month = returns.std() * np.sqrt(CONFIG["trading_days_month"])
+  vol_month = returns.std() * _scale_to_monthly(freq)
   risk_pct = vol_month * 100
 
   metrics = pd.DataFrame({
@@ -660,17 +784,20 @@ def _refresh_cache_from_db() -> None:
   codes = etf_df["Code"].tolist()
   end = pd.Timestamp.today().normalize()
   start = end - pd.DateOffset(months=CONFIG["months"])
-  close = load_close_prices(codes, start, end)
+  close_raw = load_close_prices(codes, start, end)
+  freq = _resolve_analysis_freq()
+  window_periods = _resolve_window_periods(freq)
+  close_resampled = _resample_prices(close_raw, freq)
 
-  returns_tail = _compute_returns_tail(close, CONFIG["window_days"])
-  metrics = compute_metrics(etf_df, close, returns_tail=returns_tail)
+  returns_tail = _compute_returns_tail(close_resampled, window_periods)
+  metrics = compute_metrics(etf_df, close_raw, returns_tail=returns_tail)
   recommendations = select_best_by_bucket(metrics)
-  delta3m = compute_delta3m(close)
+  delta3m = compute_delta3m(close_raw)
 
   cached_at = _now_kst()
   _CACHE["timestamp"] = time.time()
   _CACHE["cached_at"] = cached_at.isoformat(timespec="seconds")
-  _CACHE["data_asof"] = _get_data_asof(close)
+  _CACHE["data_asof"] = _get_data_asof(close_raw)
   _CACHE["metrics"] = metrics
   _CACHE["recommendations"] = recommendations
   _CACHE["delta3m"] = delta3m
@@ -834,46 +961,161 @@ def _format_weight_percentages(weights: np.ndarray, decimals: int = 2) -> List[f
   return [float(value) for value in percents]
 
 
-def _qp_solve_weights(
+def _preferred_solver_order() -> List[str]:
+  return ["ECOS", "OSQP", "SCS", "CLARABEL"]
+
+
+def _solve_socp_with_fallback(
+  problem,
+  solver_order: List[str],
+) -> Tuple[str | None, List[Dict[str, object]]]:
+  attempts: List[Dict[str, object]] = []
+  chosen_solver = None
+  for solver_name in solver_order:
+    try:
+      problem.solve(solver=solver_name, warm_start=True)
+      status = str(problem.status)
+      attempts.append({"solver": solver_name, "status": status})
+      if status in ("optimal", "optimal_inaccurate"):
+        chosen_solver = solver_name
+        break
+    except Exception as exc:
+      attempts.append({"solver": solver_name, "status": "error", "error": str(exc)})
+  return chosen_solver, attempts
+
+
+def _soc_factor_from_sigma(sigma: np.ndarray) -> np.ndarray:
+  sigma_sym = (sigma + sigma.T) / 2
+  eigvals, eigvecs = np.linalg.eigh(sigma_sym)
+  eigvals = np.clip(eigvals, 0.0, None)
+  return np.diag(np.sqrt(eigvals)) @ eigvecs.T
+
+
+def _solve_risk_target_socp(
   mu: np.ndarray,
   sigma: np.ndarray,
-  gamma: float,
-  upper_bounds: np.ndarray | None = None,
-  solver: str | None = None,
-) -> np.ndarray | None:
+  upper_bounds: np.ndarray,
+  required_class_indices: List[List[int]],
+  r_target_pct: float,
+  scale_to_monthly: float,
+  lower_bounds: np.ndarray | None = None,
+) -> Dict[str, object]:
+  try:
+    import cvxpy as cp
+  except Exception:
+    return {
+      "weights": None,
+      "chosen_solver": None,
+      "solver_attempts": [],
+      "solver_diag": {"status": "missing_solver"},
+      "fail_reason": "missing_solver",
+    }
+  n = len(mu)
+  if n == 0:
+    return {
+      "weights": None,
+      "chosen_solver": None,
+      "solver_attempts": [],
+      "solver_diag": {"status": "empty_universe"},
+      "fail_reason": "infeasible",
+    }
+  sigma_work = np.array(sigma, dtype=float)
+  sigma_work = (sigma_work + sigma_work.T) / 2
+  sigma_work = sigma_work + np.eye(n) * 1e-8
+  sigma_psd = cp.psd_wrap(sigma_work)
+  risk_cap_daily = float(r_target_pct) / 100.0 / max(float(scale_to_monthly), 1e-12)
+  if risk_cap_daily <= 0:
+    return {
+      "weights": None,
+      "chosen_solver": None,
+      "solver_attempts": [],
+      "solver_diag": {"status": "bad_target"},
+      "fail_reason": "risk_too_low",
+    }
+
+  w = cp.Variable(n, nonneg=True)
+  soc_factor = _soc_factor_from_sigma(sigma_work)
+  constraints = [cp.sum(w) == 1, w <= np.array(upper_bounds, dtype=float)]
+  if lower_bounds is not None and len(lower_bounds) == n:
+    constraints.append(w >= np.array(lower_bounds, dtype=float))
+  for indices in required_class_indices:
+    if indices:
+      constraints.append(cp.sum(w[indices]) >= 0.05)
+  constraints.append(cp.SOC(risk_cap_daily, soc_factor @ w))
+  constraints.append(cp.quad_form(w, sigma_psd) <= (risk_cap_daily ** 2))
+  objective = cp.Maximize(mu @ w)
+  prob = cp.Problem(objective, constraints)
+
+  chosen_solver, attempts = _solve_socp_with_fallback(prob, _preferred_solver_order())
+  if chosen_solver is None or w.value is None:
+    fail_reason = "infeasible"
+    if str(prob.status) in ("infeasible", "infeasible_inaccurate"):
+      fail_reason = "infeasible"
+    return {
+      "weights": None,
+      "chosen_solver": chosen_solver,
+      "solver_attempts": attempts,
+      "solver_diag": {"status": str(prob.status)},
+      "fail_reason": fail_reason,
+    }
+
+  weights = _normalize_weights(np.array(w.value, dtype=float).flatten())
+  return {
+    "weights": weights,
+    "chosen_solver": chosen_solver,
+    "solver_attempts": attempts,
+    "solver_diag": {
+      "status": str(prob.status),
+      "objective_value": None if prob.value is None else float(prob.value),
+      "r_target_pct": float(r_target_pct),
+      "risk_cap_daily": float(risk_cap_daily),
+    },
+    "fail_reason": None,
+  }
+
+
+def _estimate_min_risk_pct(
+  sigma: np.ndarray,
+  upper_bounds: np.ndarray,
+  required_class_indices: List[List[int]],
+  scale_to_monthly: float,
+  lower_bounds: np.ndarray | None = None,
+) -> float | None:
   try:
     import cvxpy as cp
   except Exception:
     return None
-  n = len(mu)
+  n = len(upper_bounds)
   if n == 0:
     return None
+  sigma_work = np.array(sigma, dtype=float)
+  sigma_work = (sigma_work + sigma_work.T) / 2
+  sigma_work = sigma_work + np.eye(n) * 1e-8
   w = cp.Variable(n, nonneg=True)
-  objective = cp.Maximize(mu @ w - gamma * cp.quad_form(w, sigma))
-  constraints = [cp.sum(w) == 1]
-  if upper_bounds is not None and len(upper_bounds) == n:
-    constraints.append(w <= np.array(upper_bounds, dtype=float))
+  soc_factor = _soc_factor_from_sigma(sigma_work)
+  constraints = [cp.sum(w) == 1, w <= np.array(upper_bounds, dtype=float)]
+  if lower_bounds is not None and len(lower_bounds) == n:
+    constraints.append(w >= np.array(lower_bounds, dtype=float))
+  for indices in required_class_indices:
+    if indices:
+      constraints.append(cp.sum(w[indices]) >= 0.05)
+  objective = cp.Minimize(cp.norm(soc_factor @ w, 2))
   prob = cp.Problem(objective, constraints)
-  try:
-    if solver:
-      prob.solve(solver=solver, warm_start=True)
-    else:
-      prob.solve(warm_start=True)
-  except Exception:
+  chosen_solver, _ = _solve_socp_with_fallback(prob, _preferred_solver_order())
+  if chosen_solver is None or w.value is None:
     return None
-  if w.value is None:
-    return None
-  return np.array(w.value, dtype=float).flatten()
+  risk_daily = float(np.linalg.norm(soc_factor @ np.array(w.value, dtype=float).flatten()))
+  return float(risk_daily * float(scale_to_monthly) * 100)
 
 
-def _portfolio_risk_pct(weights: np.ndarray, sigma: np.ndarray) -> float | None:
+def _portfolio_risk_pct(weights: np.ndarray, sigma: np.ndarray, scale_to_monthly: float) -> float | None:
   if weights.size == 0:
     return None
   variance = float(weights.T @ sigma @ weights)
   if variance < 0:
     return None
   daily_vol = np.sqrt(variance)
-  monthly_vol = daily_vol * np.sqrt(CONFIG["trading_days_month"]) * 100
+  monthly_vol = daily_vol * float(scale_to_monthly) * 100
   return float(monthly_vol)
 
 
@@ -925,6 +1167,7 @@ def _compute_portfolio_sharpe_from_returns(
   returns_tail: pd.DataFrame,
   codes: List[str],
   weights: np.ndarray,
+  periods_per_year: float,
 ) -> float | None:
   if returns_tail is None or returns_tail.empty or not codes:
     return None
@@ -937,7 +1180,7 @@ def _compute_portfolio_sharpe_from_returns(
   std = rp.std()
   if std is None or np.isnan(std) or std == 0:
     return None
-  return float((rp.mean() / std) * np.sqrt(252))
+  return float((rp.mean() / std) * np.sqrt(periods_per_year))
 
 
 def _select_qp_holdings_topk(
@@ -986,15 +1229,26 @@ def _generate_portfolios_qp(
   except Exception:
     solver_available = False
 
+  freq = _resolve_analysis_freq()
+  window_periods = _resolve_window_periods(freq)
+  scale_to_monthly = _scale_to_monthly(freq)
+  periods_per_year = _periods_per_year(freq)
+  alignment_policy = str(CONFIG.get("alignment_policy", "intersection"))
+  shrink_alpha = float(CONFIG.get("cov_shrink_alpha", 0.05))
   topn_config = config.get("topN_by_class", 20)
   meta = {
     "version": "qp-v2",
     "topN_by_class": topn_config,
-    "window_days": int(CONFIG["window_days"]),
-    "window_weeks": 52,
+    "window_days": int(CONFIG.get("window_days", 260)),
+    "window_weeks": int(CONFIG.get("window_periods_by_freq", {}).get("weekly", 52)),
+    "window_periods": int(window_periods),
+    "freq": freq,
+    "scale_to_monthly": float(scale_to_monthly),
+    "alignment_policy": alignment_policy,
+    "cov_shrink_alpha": float(shrink_alpha),
     "solver_available": solver_available,
     "score_mode": "sharpe",
-    "sharpe_window": int(CONFIG["window_days"]),
+    "sharpe_window": int(window_periods),
   }
 
   pools = _build_candidate_pools(metrics, config)
@@ -1014,12 +1268,18 @@ def _generate_portfolios_qp(
       holdings_rows.append(dict(row))
       used_codes.add(code)
 
-  qp_audit = None
+  qp_audit: Dict[str, object] = {
+    "freq": freq,
+    "window_periods": int(window_periods),
+    "scale_to_monthly": float(scale_to_monthly),
+    "cov_shrink_alpha": float(shrink_alpha),
+    "alignment_policy": alignment_policy,
+  }
   if debug:
-    qp_audit = {
+    qp_audit.update({
       "S0_universe": int(len(metrics.dropna(subset=["Code", "Name"]))),
       "buckets": {},
-    }
+    })
     for bucket in _bucket_bounds():
       qp_audit["buckets"][bucket["label"]] = {
         "S1_candidate_topN": {
@@ -1035,6 +1295,9 @@ def _generate_portfolios_qp(
         "S4_class_min_feasible": int(feasible_before),
         "S5_portfolios_produced": 0,
         "solver_failure_reason": None,
+        "solver_attempts": [],
+        "chosen_solver": None,
+        "solver_diag": None,
       }
 
   items: List[Dict[str, object]] = []
@@ -1062,12 +1325,12 @@ def _generate_portfolios_qp(
         "return_6m": None,
         "holdings": [],
         "error": "missing_solver",
+        "fail_reason": "missing_solver",
         "meta": {
           "constraints": constraints_meta,
         },
       })
-    if qp_audit is not None:
-      meta["qp_audit"] = qp_audit
+    meta["qp_audit"] = qp_audit
     return items, meta
 
   if returns_tail is None or returns_tail.empty:
@@ -1091,12 +1354,12 @@ def _generate_portfolios_qp(
         "return_6m": None,
         "holdings": [],
         "error": "missing_covariance",
+        "fail_reason": "missing_covariance",
         "meta": {
           "constraints": constraints_meta,
         },
       })
-    if qp_audit is not None:
-      meta["qp_audit"] = qp_audit
+    meta["qp_audit"] = qp_audit
     return items, meta
 
   if not holdings_rows:
@@ -1120,16 +1383,20 @@ def _generate_portfolios_qp(
         "return_6m": None,
         "holdings": [],
         "error": "insufficient_candidates",
+        "fail_reason": "insufficient_candidates",
         "meta": {
           "constraints": constraints_meta,
         },
       })
-    if qp_audit is not None:
-      meta["qp_audit"] = qp_audit
+    meta["qp_audit"] = qp_audit
     return items, meta
 
   codes = [h["Code"] for h in holdings_rows]
-  returns_slice_all = returns_tail.reindex(columns=codes).dropna(how="any")
+  returns_slice_all = _align_prices_by_date_index(
+    returns_tail.reindex(columns=codes),
+    codes=codes,
+    policy=alignment_policy,
+  )
   if returns_slice_all.empty:
     for bucket in _bucket_bounds():
       constraints_meta = {
@@ -1151,12 +1418,12 @@ def _generate_portfolios_qp(
         "return_6m": None,
         "holdings": [],
         "error": "missing_covariance",
+        "fail_reason": "missing_covariance",
         "meta": {
           "constraints": constraints_meta,
         },
       })
-    if qp_audit is not None:
-      meta["qp_audit"] = qp_audit
+    meta["qp_audit"] = qp_audit
     return items, meta
 
   sigma = returns_slice_all.cov().values
@@ -1181,61 +1448,58 @@ def _generate_portfolios_qp(
         "return_6m": None,
         "holdings": [],
         "error": "missing_covariance",
+        "fail_reason": "missing_covariance",
         "meta": {
           "constraints": constraints_meta,
         },
       })
-    if qp_audit is not None:
-      meta["qp_audit"] = qp_audit
+    meta["qp_audit"] = qp_audit
     return items, meta
 
   sigma = (sigma + sigma.T) / 2
+  sigma = _apply_diagonal_shrinkage(sigma, shrink_alpha)
   sigma = sigma + np.eye(len(codes)) * 1e-8
   mu = np.array([float(h.get("sharpe_window", 0.0)) for h in holdings_rows], dtype=float)
   upper_bounds = np.array(
     [0.4 if h["asset_class"] == "CashLike" else 0.3 for h in holdings_rows],
     dtype=float,
   )
+  class_indices = {
+    asset_class: [idx for idx, row in enumerate(holdings_rows) if row["asset_class"] == asset_class]
+    for asset_class in required_classes
+  }
+  required_class_indices = [indices for indices in class_indices.values() if indices]
+  min_risk_pct = _estimate_min_risk_pct(
+    sigma,
+    upper_bounds=upper_bounds,
+    required_class_indices=required_class_indices,
+    scale_to_monthly=scale_to_monthly,
+    lower_bounds=None,
+  )
 
   for bucket in _bucket_bounds():
     bucket_label = bucket["label"]
+    r_target_pct = _bucket_target(bucket)
     constraints_meta = {
       "required_classes": required_classes,
       "relaxed_classes": relaxed_classes,
       "feasible_before": feasible_before,
     }
 
-    gamma = 1.0
-    best_weights = None
-    best_risk = None
-    best_gamma = None
-    gamma_low = 1e-4
-    gamma_high = 1e4
-    solver_failure_reason = None
-
-    for _ in range(16):
-      weights = _qp_solve_weights(mu, sigma, gamma, upper_bounds=upper_bounds)
-      if weights is None:
-        solver_failure_reason = "solver_failed"
-        break
-      weights = _normalize_weights(weights)
-      risk_pct = _portfolio_risk_pct(weights, sigma)
-      best_weights = weights
-      best_risk = risk_pct
-      best_gamma = gamma
-      if risk_pct is None:
-        solver_failure_reason = "invalid_risk"
-        break
-      if _risk_in_bucket(risk_pct, bucket):
-        break
-      if risk_pct < float(bucket["min"]):
-        gamma_high = gamma
-        gamma = (gamma_low + gamma) / 2
-      else:
-        gamma_low = gamma
-        gamma = (gamma + gamma_high) / 2
-
+    solve_all = _solve_risk_target_socp(
+      mu=mu,
+      sigma=sigma,
+      upper_bounds=upper_bounds,
+      required_class_indices=required_class_indices,
+      r_target_pct=r_target_pct,
+      scale_to_monthly=scale_to_monthly,
+      lower_bounds=None,
+    )
+    best_weights = solve_all.get("weights")
+    fail_reason = solve_all.get("fail_reason")
     if best_weights is None:
+      if fail_reason == "infeasible" and min_risk_pct is not None and min_risk_pct > (r_target_pct + 1e-6):
+        fail_reason = "risk_too_low"
       if debug:
         constraints_meta.update({
           "constraints_met": False,
@@ -1243,22 +1507,29 @@ def _generate_portfolios_qp(
           "holdings_display_limit": int(max_holdings),
           "holdings_display_truncated": False,
         })
+        qp_audit["buckets"][bucket_label]["solver_attempts"] = solve_all.get("solver_attempts") or []
+        qp_audit["buckets"][bucket_label]["chosen_solver"] = solve_all.get("chosen_solver")
+        qp_audit["buckets"][bucket_label]["solver_diag"] = solve_all.get("solver_diag")
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
-        "error": solver_failure_reason or "solver_failed",
+        "error": fail_reason or "infeasible",
+        "fail_reason": fail_reason or "infeasible",
         "meta": {
-          "gamma": best_gamma,
+          "target_risk": float(r_target_pct),
           "within_bucket": False,
           "lo": bucket["min"],
           "hi": bucket["max"],
+          "solver_diag": solve_all.get("solver_diag"),
+          "solver_attempts": solve_all.get("solver_attempts"),
+          "chosen_solver": solve_all.get("chosen_solver"),
           "constraints": constraints_meta,
         },
       })
       if debug:
-        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = solver_failure_reason or "solver_failed"
+        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = fail_reason or "infeasible"
       continue
 
     selected_indices, display_truncated = _select_qp_holdings_topk(
@@ -1277,31 +1548,65 @@ def _generate_portfolios_qp(
           "holdings_display_truncated": False,
         })
         qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_empty"
+        qp_audit["buckets"][bucket_label]["solver_attempts"] = solve_all.get("solver_attempts") or []
+        qp_audit["buckets"][bucket_label]["chosen_solver"] = solve_all.get("chosen_solver")
+        qp_audit["buckets"][bucket_label]["solver_diag"] = solve_all.get("solver_diag")
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "postprocess_empty",
+        "fail_reason": "infeasible",
         "meta": {
-          "gamma": best_gamma,
+          "target_risk": float(r_target_pct),
           "within_bucket": False,
           "lo": bucket["min"],
           "hi": bucket["max"],
+          "solver_diag": solve_all.get("solver_diag"),
+          "solver_attempts": solve_all.get("solver_attempts"),
+          "chosen_solver": solve_all.get("chosen_solver"),
           "constraints": constraints_meta,
         },
       })
       continue
 
-    selected_weights = _normalize_weights(best_weights[selected_indices])
     selected_rows = [holdings_rows[idx] for idx in selected_indices]
+    selected_codes = [row["Code"] for row in selected_rows]
+    selected_pos = [codes.index(code) for code in selected_codes]
+    mu_selected = mu[selected_pos]
+    sigma_selected = sigma[np.ix_(selected_pos, selected_pos)]
     lower_bounds = np.full(len(selected_rows), min_weight, dtype=float)
     upper_selected = np.array(
       [0.4 if h["asset_class"] == "CashLike" else 0.3 for h in selected_rows],
       dtype=float,
     )
-    projected = _project_weights_with_bounds(selected_weights, lower_bounds, upper_selected)
+    selected_class_indices: List[List[int]] = []
+    for asset_class in required_classes:
+      idxs = [i for i, row in enumerate(selected_rows) if row["asset_class"] == asset_class]
+      if idxs:
+        selected_class_indices.append(idxs)
+    solve_selected = _solve_risk_target_socp(
+      mu=mu_selected,
+      sigma=sigma_selected,
+      upper_bounds=upper_selected,
+      required_class_indices=selected_class_indices,
+      r_target_pct=r_target_pct,
+      scale_to_monthly=scale_to_monthly,
+      lower_bounds=lower_bounds,
+    )
+    projected = solve_selected.get("weights")
     if projected is None:
+      selected_min_risk = _estimate_min_risk_pct(
+        sigma_selected,
+        upper_bounds=upper_selected,
+        required_class_indices=selected_class_indices,
+        scale_to_monthly=scale_to_monthly,
+        lower_bounds=lower_bounds,
+      )
+      fail_reason = solve_selected.get("fail_reason") or "infeasible"
+      if fail_reason == "infeasible" and selected_min_risk is not None and selected_min_risk > (r_target_pct + 1e-6):
+        fail_reason = "risk_too_low"
       # Policy point: no extra implicit fallback when min/max bounds are infeasible after topK.
       if debug:
         constraints_meta.update({
@@ -1310,18 +1615,25 @@ def _generate_portfolios_qp(
           "holdings_display_limit": int(max_holdings),
           "holdings_display_truncated": bool(display_truncated),
         })
-        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_infeasible"
+        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = fail_reason
+        qp_audit["buckets"][bucket_label]["solver_attempts"] = solve_selected.get("solver_attempts") or []
+        qp_audit["buckets"][bucket_label]["chosen_solver"] = solve_selected.get("chosen_solver")
+        qp_audit["buckets"][bucket_label]["solver_diag"] = solve_selected.get("solver_diag")
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
-        "error": "postprocess_infeasible",
+        "error": fail_reason,
+        "fail_reason": fail_reason,
         "meta": {
-          "gamma": best_gamma,
+          "target_risk": float(r_target_pct),
           "within_bucket": False,
           "lo": bucket["min"],
           "hi": bucket["max"],
+          "solver_diag": solve_selected.get("solver_diag"),
+          "solver_attempts": solve_selected.get("solver_attempts"),
+          "chosen_solver": solve_selected.get("chosen_solver"),
           "constraints": constraints_meta,
         },
       })
@@ -1337,17 +1649,24 @@ def _generate_portfolios_qp(
           "holdings_display_truncated": bool(display_truncated),
         })
         qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_zero"
+        qp_audit["buckets"][bucket_label]["solver_attempts"] = solve_selected.get("solver_attempts") or []
+        qp_audit["buckets"][bucket_label]["chosen_solver"] = solve_selected.get("chosen_solver")
+        qp_audit["buckets"][bucket_label]["solver_diag"] = solve_selected.get("solver_diag")
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
         "error": "postprocess_zero",
+        "fail_reason": "infeasible",
         "meta": {
-          "gamma": best_gamma,
+          "target_risk": float(r_target_pct),
           "within_bucket": False,
           "lo": bucket["min"],
           "hi": bucket["max"],
+          "solver_diag": solve_selected.get("solver_diag"),
+          "solver_attempts": solve_selected.get("solver_attempts"),
+          "chosen_solver": solve_selected.get("chosen_solver"),
           "constraints": constraints_meta,
         },
       })
@@ -1376,8 +1695,19 @@ def _generate_portfolios_qp(
 
     final_codes = [h["Code"] for h in final_rows]
     final_sigma = sigma[np.ix_([codes.index(code) for code in final_codes], [codes.index(code) for code in final_codes])]
-    final_risk = _portfolio_risk_pct(final_weights, final_sigma)
-    final_sharpe = _compute_portfolio_sharpe_from_returns(returns_slice_all, final_codes, final_weights)
+    final_risk = _portfolio_risk_pct(final_weights, final_sigma, scale_to_monthly)
+    final_sharpe = _compute_portfolio_sharpe_from_returns(
+      returns_slice_all,
+      final_codes,
+      final_weights,
+      periods_per_year=periods_per_year,
+    )
+    if final_risk is None:
+      final_fail_reason = "infeasible"
+    elif final_risk > (float(r_target_pct) + 1e-5):
+      final_fail_reason = "risk_target_not_met"
+    else:
+      final_fail_reason = None
 
     if debug:
       constraints_meta.update({
@@ -1386,33 +1716,41 @@ def _generate_portfolios_qp(
         "holdings_display_limit": int(max_holdings),
         "holdings_display_truncated": bool(display_truncated),
       })
-      qp_audit["buckets"][bucket_label]["solver_failure_reason"] = None
-      qp_audit["buckets"][bucket_label]["S5_portfolios_produced"] = 1
+      qp_audit["buckets"][bucket_label]["solver_failure_reason"] = final_fail_reason
+      qp_audit["buckets"][bucket_label]["S5_portfolios_produced"] = 0 if final_fail_reason else 1
+      qp_audit["buckets"][bucket_label]["solver_attempts"] = solve_selected.get("solver_attempts") or []
+      qp_audit["buckets"][bucket_label]["chosen_solver"] = solve_selected.get("chosen_solver")
+      qp_audit["buckets"][bucket_label]["solver_diag"] = solve_selected.get("solver_diag")
 
     items.append({
       "risk_bucket": bucket_label,
-      "risk_pct": final_risk,
-      "return_6m": total_return,
+      "risk_pct": None if final_fail_reason else final_risk,
+      "return_6m": None if final_fail_reason else total_return,
       "sharpe_120d": final_sharpe,
       "sharpe_window": final_sharpe,
-      "holdings": holdings_output,
+      "holdings": [] if final_fail_reason else holdings_output,
+      "error": final_fail_reason,
+      "fail_reason": final_fail_reason,
       "meta": {
-        "gamma": best_gamma,
-        "within_bucket": _risk_in_bucket(final_risk, bucket) if final_risk is not None else False,
+        "target_risk": float(r_target_pct),
+        "within_bucket": (final_risk is not None and final_risk <= float(r_target_pct) + 1e-5),
         "lo": bucket["min"],
         "hi": bucket["max"],
+        "solver_diag": solve_selected.get("solver_diag"),
+        "solver_attempts": solve_selected.get("solver_attempts"),
+        "chosen_solver": solve_selected.get("chosen_solver"),
         "constraints": constraints_meta,
       },
     })
 
-  if qp_audit is not None:
+  if debug:
     for item in items:
       label = item.get("risk_bucket")
       if label in qp_audit["buckets"] and item.get("error"):
         qp_audit["buckets"][label]["S5_portfolios_produced"] = 0
         if qp_audit["buckets"][label]["solver_failure_reason"] is None:
           qp_audit["buckets"][label]["solver_failure_reason"] = str(item.get("error"))
-    meta["qp_audit"] = qp_audit
+  meta["qp_audit"] = qp_audit
 
   return items, meta
 
@@ -1514,7 +1852,7 @@ def _compute_portfolio_120d_metrics(
   if std is None or np.isnan(std) or std == 0:
     sharpe_120d = None
   else:
-    sharpe_120d = (rp.mean() / std) * np.sqrt(252)
+    sharpe_120d = (rp.mean() / std) * np.sqrt(_periods_per_year(_resolve_analysis_freq()))
   return float(return_120d), None if sharpe_120d is None else float(sharpe_120d)
 
 
@@ -1903,9 +2241,12 @@ def generate_portfolios(
     "return_6m_unit": "cumulative",
     "return_120d_unit": "cumulative",
     "sharpe_120d_unit": "annualized",
-    "window_days": int(CONFIG["window_days"]),
-    "window_weeks": 52,
-    "sharpe_window_days": int(CONFIG["window_days"]),
+    "window_days": int(CONFIG.get("window_days", 260)),
+    "window_weeks": int(CONFIG.get("window_periods_by_freq", {}).get("weekly", 52)),
+    "window_periods": int(_resolve_window_periods(_resolve_analysis_freq())),
+    "freq": _resolve_analysis_freq(),
+    "scale_to_monthly": float(_scale_to_monthly(_resolve_analysis_freq())),
+    "sharpe_window_days": int(CONFIG.get("window_days", 260)),
     "score_mode": score_mode,
   }
   if meta is None:
