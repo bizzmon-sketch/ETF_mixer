@@ -809,7 +809,7 @@ def _risk_scaling_policy(freq: str, periods_per_year: int) -> Dict[str, object]:
   window_days = int(CONFIG["window_days"])
   window_weeks = max(1, int(round(window_days / 5)))
   window_periods = window_days if freq_value == "daily" else window_weeks
-  scale_to_monthly = float(np.sqrt(ppy / 12.0) * 100.0)
+  scale_to_monthly = float(np.sqrt(ppy / 12.0))
   return {
     "freq": freq_value,
     "periods_per_year": int(ppy),
@@ -1146,7 +1146,7 @@ def _qp_solve_weights(
     if upper_arr is not None:
       constraints.append(w <= upper_arr)
     if risk_cap_pct is not None and scale_to_monthly is not None and scale_to_monthly > 0:
-      cap_variance = float((float(risk_cap_pct) / float(scale_to_monthly)) ** 2)
+      cap_variance = float(((float(risk_cap_pct) / 100.0) / float(scale_to_monthly)) ** 2)
       constraints.append(cp.quad_form(w, sigma_qp) <= cap_variance)
       attempt["cap_variance"] = _to_json_float(cap_variance)
     prob = cp.Problem(objective, constraints)
@@ -1199,9 +1199,9 @@ def _portfolio_risk_pct(
   if not np.isfinite(period_vol):
     return None
   if scale_to_monthly is None or scale_to_monthly <= 0:
-    scale_to_monthly = float(np.sqrt(252 / 12.0) * 100.0)
+    scale_to_monthly = float(np.sqrt(252 / 12.0))
   monthly_vol = period_vol * float(scale_to_monthly)
-  return float(monthly_vol)
+  return float(monthly_vol * 100.0)
 
 
 def _project_weights_with_bounds(
@@ -1319,6 +1319,10 @@ def _generate_portfolios_qp(
   topn_config = config.get("topN_by_class", 20)
   inferred_freq, inferred_ppy = _infer_returns_frequency(returns_tail)
   scaling_policy = _risk_scaling_policy(inferred_freq, inferred_ppy)
+  try:
+    cov_shrink_alpha = float(config.get("cov_shrink_alpha", 0.0))
+  except Exception:
+    cov_shrink_alpha = 0.0
   meta = {
     "version": "qp-v2",
     "topN_by_class": topn_config,
@@ -1327,6 +1331,7 @@ def _generate_portfolios_qp(
     "window_days": scaling_policy["window_days"],
     "window_weeks": scaling_policy["window_weeks"],
     "scale_to_monthly": scaling_policy["scale_to_monthly"],
+    "cov_shrink_alpha": cov_shrink_alpha,
     "solver_available": solver_available,
     "score_mode": "sharpe",
     "sharpe_window": scaling_policy["window_periods"],
@@ -1357,6 +1362,10 @@ def _generate_portfolios_qp(
   qp_audit = None
   if debug:
     qp_audit = {
+      "freq": meta["freq"],
+      "window_periods": int(meta["window_periods"]),
+      "scale_to_monthly": float(meta["scale_to_monthly"]),
+      "cov_shrink_alpha": float(meta["cov_shrink_alpha"]),
       "S0_universe": int(len(metrics.dropna(subset=["Code", "Name"]))),
       "buckets": {},
     }
@@ -2397,9 +2406,27 @@ def generate_portfolios(
   meta["freq"] = meta.get("freq", scaling_policy["freq"])
   meta["window_periods"] = int(meta.get("window_periods", scaling_policy["window_periods"]))
   meta["scale_to_monthly"] = float(meta.get("scale_to_monthly", scaling_policy["scale_to_monthly"]))
+  if bool(debug) and str(meta.get("freq", "")).lower() == "daily" and float(meta.get("scale_to_monthly", 0.0)) > 50.0:
+    meta["debug_warning"] = "scale_to_monthly_suspicious"
   existing_units = meta.get("units") if isinstance(meta.get("units"), dict) else {}
   meta["units"] = {**existing_units, **units}
   meta["score_mode"] = units["score_mode"]
+  qp_audit = meta.get("qp_audit") if isinstance(meta.get("qp_audit"), dict) else None
+  if qp_audit is not None:
+    cov_alpha = meta.get("cov_shrink_alpha", qp_audit.get("cov_shrink_alpha", 0.0))
+    try:
+      cov_alpha = float(cov_alpha)
+    except Exception:
+      cov_alpha = 0.0
+    qp_audit.update({
+      "freq": meta["freq"],
+      "window_periods": int(meta["window_periods"]),
+      "scale_to_monthly": float(meta["scale_to_monthly"]),
+      "cov_shrink_alpha": cov_alpha,
+    })
+    if meta.get("debug_warning"):
+      qp_audit["warning"] = str(meta["debug_warning"])
+    meta["qp_audit"] = qp_audit
   return format_portfolios(items, strategy, meta)
 
 
