@@ -1139,6 +1139,8 @@ def _qp_solve_weights(
       "status": None,
       "fail_reason": None,
       "prob_value": None,
+      "achieved_variance": None,
+      "achieved_risk_pct": None,
     }
     w = cp.Variable(n, nonneg=True)
     objective = cp.Maximize(mu_arr @ w - float(gamma) * cp.quad_form(w, sigma_qp))
@@ -1176,6 +1178,21 @@ def _qp_solve_weights(
       diag["solver_attempts"].append(attempt)
       last_fail_reason = str(attempt["fail_reason"])
       continue
+    try:
+      if (
+        sigma_work is not None
+        and isinstance(sigma_work, np.ndarray)
+        and sigma_work.ndim == 2
+        and sigma_work.shape[0] == sigma_work.shape[1]
+        and weights.size == sigma_work.shape[0]
+      ):
+        achieved_variance = float(weights.T @ (sigma_work @ weights))
+        attempt["achieved_variance"] = _to_json_float(achieved_variance)
+        achieved_risk_pct = np.sqrt(max(0.0, achieved_variance)) * float(scale_to_monthly) * 100.0
+        attempt["achieved_risk_pct"] = _to_json_float(achieved_risk_pct)
+    except Exception:
+      attempt["achieved_variance"] = None
+      attempt["achieved_risk_pct"] = None
     diag["chosen_solver"] = solver_name
     diag["solver_attempts"].append(attempt)
     diag["fail_reason"] = None
