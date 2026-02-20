@@ -17,10 +17,12 @@ import FinanceDataReader as fdr
 CONFIG = {
   "etf_list_path": "data/etf_list.csv",
   "price_db_path": "data/prices.sqlite",
-  "months": 6,
+  "months": 15,
   "min_observations": 90,
   "trading_days_month": 21,
   "window_days": 260,
+  "weekly_window": 52,
+  "weekly_min_observations": 30,
   "cache_ttl_sec": 600,
   "refresh_buffer_days": 3,
   "refresh_interval_sec": 600,
@@ -32,6 +34,12 @@ CONFIG = {
   "portfolio_weight_step": 5,
   "fdr_source": None,
 }
+
+# [P0-2] 주봉 단위 규약 전역 상수
+_WEEKLY_PERIODS_PER_YEAR = 52
+_WEEKLY_SCALE_TO_MONTHLY = float(np.sqrt(52.0 / 12.0))
+_RF_ANNUAL = 0.03
+_RF_WEEKLY = _RF_ANNUAL / 52.0
 
 RISK_BUCKETS: List[Tuple[float, float, str]] = [
   (0.0, 3.0, "0-3%"),
@@ -54,6 +62,10 @@ _CACHE: Dict[str, object] = {
   "refresh_mode": None,
   "cached_at": None,
   "data_asof": None,
+  "is_week_partial": False,
+  "weekly_excluded": [],
+  "weekly_last_label": None,
+  "weekly_last_observed": None,
 }
 
 logger = logging.getLogger(__name__)
@@ -279,6 +291,115 @@ def classify_risk(risk_pct: float) -> str | None:
   return None
 
 
+def build_weekly_price_matrix(
+  price_df_daily: pd.DataFrame,
+  window_weeks: int = 52,
+) -> Dict[str, object]:
+  """
+  [P0-2] 일봉 close -> 주봉 리샘플링 -> 로그 수익률 52주 윈도우.
+  당주 처리: 방식 B (당주 포함, partial 플래그 + 관측일/라벨 분리 기록).
+  """
+  empty_result = {
+    "prices": pd.DataFrame(),
+    "log_returns": pd.DataFrame(),
+    "data_as_of": None,
+    "weekly_last_label": None,
+    "weekly_last_observed": None,
+    "is_current_week_partial": False,
+    "excluded": [],
+    "n_weeks": 0,
+  }
+  if price_df_daily.empty:
+    return empty_result
+
+  try:
+    last_observed = price_df_daily.dropna(how="all").index.max()
+  except Exception:
+    last_observed = None
+
+  price_weekly = price_df_daily.resample("W-FRI", label="right", closed="right").last()
+  if price_weekly.empty:
+    return empty_result
+  weekly_last_label = price_weekly.index.max()
+
+  is_partial = False
+  if last_observed is not None and weekly_last_label is not None:
+    is_partial = bool(last_observed < weekly_last_label)
+
+  if len(price_weekly) > window_weeks + 1:
+    price_weekly = price_weekly.iloc[-(window_weeks + 1):]
+
+  price_weekly = price_weekly.ffill(limit=1)
+
+  min_obs = int(CONFIG.get("weekly_min_observations", 30))
+  valid_counts = price_weekly.count()
+  excluded = valid_counts[valid_counts < min_obs].index.tolist()
+  valid_cols = valid_counts[valid_counts >= min_obs].index.tolist()
+  price_weekly = price_weekly[valid_cols] if valid_cols else pd.DataFrame()
+  if price_weekly.empty:
+    return empty_result
+
+  log_price = np.log(price_weekly.replace(0, np.nan))
+  log_returns = log_price.diff().dropna(how="all")
+  if len(log_returns) > window_weeks:
+    log_returns = log_returns.iloc[-window_weeks:]
+
+  def _fmt_dt(x: object) -> str | None:
+    return x.strftime("%Y-%m-%d") if hasattr(x, "strftime") else (str(x)[:10] if x is not None else None)
+
+  weekly_last_label_s = _fmt_dt(weekly_last_label)
+  weekly_last_observed_s = _fmt_dt(last_observed)
+  data_as_of = weekly_last_observed_s or weekly_last_label_s
+
+  return {
+    "prices": price_weekly,
+    "log_returns": log_returns,
+    "data_as_of": data_as_of,
+    "weekly_last_label": weekly_last_label_s,
+    "weekly_last_observed": weekly_last_observed_s,
+    "is_current_week_partial": bool(is_partial),
+    "excluded": excluded,
+    "n_weeks": int(len(log_returns)),
+  }
+
+
+def compute_weekly_metrics_series(log_returns_series: pd.Series) -> Dict[str, float] | None:
+  """
+  [P0-2] 단일 ETF 주봉 로그 수익률 -> 지표
+  내부 계산: log
+  UI 표시: return_52w는 exp(sum(log))-1 (simple 변환)
+  """
+  r = log_returns_series.dropna()
+  if len(r) < 30:
+    return None
+
+  std = float(r.std(ddof=1))
+  if std < 1e-9:
+    return None
+
+  log_cumsum = float(r.sum())
+  return_52w = float(np.exp(log_cumsum) - 1.0)
+
+  risk_monthly_pct = std * _WEEKLY_SCALE_TO_MONTHLY * 100.0
+  risk_annual_pct = std * np.sqrt(52.0) * 100.0
+
+  mean_r = float(r.mean())
+  sharpe_52w = (mean_r - _RF_WEEKLY) / std * np.sqrt(52.0)
+
+  mean_log_r_weekly = mean_r
+  mean_log_r_ann = mean_r * 52.0
+
+  return {
+    "return_52w": round(return_52w, 6),
+    "risk_weekly_std": round(std, 8),
+    "risk_pct": round(risk_monthly_pct, 4),
+    "risk_annual_pct": round(risk_annual_pct, 4),
+    "sharpe_52w_ann": round(sharpe_52w, 4),
+    "mean_log_r_weekly": round(mean_log_r_weekly, 10),
+    "mean_log_r_ann": round(mean_log_r_ann, 10),
+  }
+
+
 def _compute_returns_tail(close: pd.DataFrame, window_days: int) -> pd.DataFrame:
   if close.empty:
     return pd.DataFrame()
@@ -294,52 +415,65 @@ def _compute_returns_tail(close: pd.DataFrame, window_days: int) -> pd.DataFrame
 def compute_metrics(
   etf_df: pd.DataFrame,
   close: pd.DataFrame,
-  returns_tail: pd.DataFrame | None = None,
+  returns_tail: pd.DataFrame | None = None,  # backward-compat, unused
 ) -> pd.DataFrame:
+  """
+  [P0-2] 주봉 52주 기반 메트릭 (내부 log, UI simple).
+  하위 호환 필드 유지:
+    return_6m=return_52w, sharpe_120d=sharpe_52w_ann
+  """
+  _ = returns_tail
+  empty_cols = [
+    "Code", "Name",
+    "return_52w",
+    "return_6m",
+    "sharpe_52w_ann",
+    "sharpe_120d",
+    "risk_6m",
+    "risk_pct",
+    "risk_bucket",
+    "mean_log_r_ann",
+    "mean_log_r_weekly",
+  ]
+
   if close.empty:
-    return pd.DataFrame(columns=[
-      "Code", "Name", "return_6m", "return_120d", "sharpe_120d", "risk_6m", "risk_pct", "risk_bucket",
-    ])
+    return pd.DataFrame(columns=empty_cols)
 
-  counts = close.count()
-  eligible = counts[counts >= CONFIG["min_observations"]].index.tolist()
-  close = close[eligible].dropna(how="all")
-  if close.empty:
-    return pd.DataFrame(columns=[
-      "Code", "Name", "return_6m", "return_120d", "sharpe_120d", "risk_6m", "risk_pct", "risk_bucket",
-    ])
+  weekly_data = build_weekly_price_matrix(
+    close,
+    window_weeks=int(CONFIG.get("weekly_window", 52)),
+  )
+  log_returns = weekly_data["log_returns"]
+  excluded = weekly_data["excluded"]
+  if log_returns.empty:
+    return pd.DataFrame(columns=empty_cols)
 
-  returns = close.pct_change().dropna(how="all")
-  if returns_tail is None:
-    returns_tail = _compute_returns_tail(close, CONFIG["window_days"])
-  if not returns_tail.empty:
-    returns_tail = returns_tail.reindex(columns=eligible)
-  return_6m = (close.iloc[-1] / close.iloc[0]) - 1
-  if returns_tail.empty:
-    return_120d = pd.Series(index=return_6m.index, dtype=float)
-    sharpe_120d = pd.Series(index=return_6m.index, dtype=float)
-  else:
-    return_120d = (1 + returns_tail).prod() - 1
-    returns_mean = returns_tail.mean()
-    returns_std = returns_tail.std()
-    sharpe_120d = (returns_mean / returns_std) * np.sqrt(252)
-    sharpe_120d = sharpe_120d.replace([np.inf, -np.inf], np.nan)
-    sharpe_120d = sharpe_120d.where(returns_std > 0)
-  vol_month = returns.std() * np.sqrt(CONFIG["trading_days_month"])
-  risk_pct = vol_month * 100
+  valid_cols = [c for c in log_returns.columns if c not in excluded]
+  records = []
+  for code in valid_cols:
+    m = compute_weekly_metrics_series(log_returns[code])
+    if m is None:
+      continue
+    records.append({
+      "Code": code,
+      "return_52w": m["return_52w"],
+      "return_6m": m["return_52w"],
+      "sharpe_52w_ann": m["sharpe_52w_ann"],
+      "sharpe_120d": m["sharpe_52w_ann"],
+      "risk_6m": m["risk_weekly_std"],
+      "risk_pct": m["risk_pct"],
+      "mean_log_r_ann": m["mean_log_r_ann"],
+      "mean_log_r_weekly": m["mean_log_r_weekly"],
+    })
 
-  metrics = pd.DataFrame({
-    "Code": return_6m.index,
-    "return_6m": return_6m.values,
-    "return_120d": return_120d.values,
-    "sharpe_120d": sharpe_120d.values,
-    "risk_6m": vol_month.values,
-    "risk_pct": risk_pct.values,
-  })
+  if not records:
+    return pd.DataFrame(columns=empty_cols)
+
+  metrics = pd.DataFrame.from_records(records)
   metrics["risk_bucket"] = metrics["risk_pct"].apply(classify_risk)
   metrics = metrics.merge(etf_df, on="Code", how="left")
-  metrics = metrics[["Code", "Name", "return_6m", "return_120d", "sharpe_120d", "risk_6m", "risk_pct", "risk_bucket"]]
-  return metrics
+  out_cols = [c for c in empty_cols if c in metrics.columns]
+  return metrics[out_cols].reset_index(drop=True)
 
 
 def compute_delta3m(close: pd.DataFrame) -> pd.DataFrame:
@@ -347,7 +481,7 @@ def compute_delta3m(close: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(columns=["Code", "return_prev3m", "return_recent3m", "delta_3m"])
 
   end = close.index.max()
-  start = end - pd.DateOffset(months=CONFIG["months"])
+  start = end - pd.DateOffset(months=6)
   mid = end - pd.DateOffset(months=3)
   close_6m = close.loc[close.index >= start]
   if close_6m.empty:
@@ -660,9 +794,14 @@ def _refresh_cache_from_db() -> None:
   codes = etf_df["Code"].tolist()
   end = pd.Timestamp.today().normalize()
   start = end - pd.DateOffset(months=CONFIG["months"])
+  logger.info("[P0-1] price range: %s ~ %s, codes=%s", start.date(), end.date(), len(codes))
   close = load_close_prices(codes, start, end)
 
-  returns_tail = _compute_returns_tail(close, CONFIG["window_days"])
+  weekly_data_for_cache = build_weekly_price_matrix(
+    close,
+    window_weeks=int(CONFIG.get("weekly_window", 52)),
+  )
+  returns_tail = weekly_data_for_cache["log_returns"]
   metrics = compute_metrics(etf_df, close, returns_tail=returns_tail)
   recommendations = select_best_by_bucket(metrics)
   delta3m = compute_delta3m(close)
@@ -670,7 +809,11 @@ def _refresh_cache_from_db() -> None:
   cached_at = _now_kst()
   _CACHE["timestamp"] = time.time()
   _CACHE["cached_at"] = cached_at.isoformat(timespec="seconds")
-  _CACHE["data_asof"] = _get_data_asof(close)
+  _CACHE["data_asof"] = weekly_data_for_cache["data_as_of"]
+  _CACHE["is_week_partial"] = weekly_data_for_cache["is_current_week_partial"]
+  _CACHE["weekly_excluded"] = weekly_data_for_cache["excluded"]
+  _CACHE["weekly_last_label"] = weekly_data_for_cache.get("weekly_last_label")
+  _CACHE["weekly_last_observed"] = weekly_data_for_cache.get("weekly_last_observed")
   _CACHE["metrics"] = metrics
   _CACHE["recommendations"] = recommendations
   _CACHE["delta3m"] = delta3m
@@ -743,6 +886,9 @@ def get_scatter_meta() -> Dict[str, object]:
     "refresh_mode": _CACHE.get("refresh_mode"),
     "cached_at": _CACHE.get("cached_at"),
     "data_asof": _CACHE.get("data_asof"),
+    "is_current_week_partial": _CACHE.get("is_week_partial", False),
+    "weekly_last_label": _CACHE.get("weekly_last_label"),
+    "weekly_last_observed": _CACHE.get("weekly_last_observed"),
     "last_refresh_ts": last_refresh_value,
   }
 
@@ -949,9 +1095,11 @@ def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> 
       {
         "Code": row["Code"],
         "Name": row["Name"],
+        "return_52w": float(row.get("return_52w") or row["return_6m"]),
         "return_6m": float(row["return_6m"]),
         "risk_pct": float(row["risk_pct"]),
         "sharpe_window": float(row["sharpe_120d"]),
+        "mean_log_r_ann": float(row.get("mean_log_r_ann") or 0.0),
         "asset_class": asset_class,
       }
       for _, row in selected.iterrows()
@@ -1269,7 +1417,7 @@ def _compute_portfolio_sharpe_from_returns(
   returns_tail: pd.DataFrame,
   codes: List[str],
   weights: np.ndarray,
-  periods_per_year: int = 252,
+  periods_per_year: int = 52,
 ) -> float | None:
   if returns_tail is None or returns_tail.empty or not codes:
     return None
@@ -1282,8 +1430,10 @@ def _compute_portfolio_sharpe_from_returns(
   std = rp.std()
   if std is None or np.isnan(std) or std == 0:
     return None
-  annualizer = float(np.sqrt(periods_per_year if periods_per_year > 0 else 252))
-  return float((rp.mean() / std) * annualizer)
+  ppy = int(periods_per_year) if periods_per_year and periods_per_year > 0 else 52
+  annualizer = float(np.sqrt(ppy))
+  rf_per_period = _RF_ANNUAL / float(ppy)
+  return float(((rp.mean() - rf_per_period) / std) * annualizer)
 
 
 def _select_qp_holdings_topk(
@@ -1550,6 +1700,7 @@ def _generate_portfolios_qp(
       meta["qp_audit"] = qp_audit
     return items, meta
 
+  # P0-2: sigma = 주봉 로그 수익률 공분산
   sigma = returns_slice_all.cov().values
   sigma = (sigma + sigma.T) / 2
   if not np.isfinite(sigma).all():
@@ -1585,7 +1736,11 @@ def _generate_portfolios_qp(
       meta["qp_audit"] = qp_audit
     return items, meta
 
-  mu = np.array([float(h.get("sharpe_window", 0.0)) for h in holdings_rows], dtype=float)
+  # P0-2: mu는 주봉 log 기반 연환산 기대수익(선형 결합 자연스러움)
+  mu = np.array(
+    [float(h.get("mean_log_r_ann") or 0.0) for h in holdings_rows],
+    dtype=float,
+  )
   upper_bounds = np.array(
     [0.4 if h["asset_class"] == "CashLike" else 0.3 for h in holdings_rows],
     dtype=float,

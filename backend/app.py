@@ -31,6 +31,42 @@ def _attach_metadata(payload: object, source: str) -> object:
   return payload
 
 
+def _weekly_meta_from_cache() -> dict:
+  cache = engine._CACHE if hasattr(engine, "_CACHE") else {}
+  return {
+    "data_as_of": cache.get("data_asof"),
+    "is_current_week_partial": cache.get("is_week_partial", False),
+    "weekly_last_label": cache.get("weekly_last_label"),
+    "weekly_last_observed": cache.get("weekly_last_observed"),
+  }
+
+
+def _enrich_scatter_payload(payload: object) -> object:
+  if not isinstance(payload, dict):
+    return payload
+  enriched = dict(payload)
+  base_meta = dict(enriched.get("meta") or {})
+  base_meta.update(_weekly_meta_from_cache())
+  enriched["meta"] = base_meta
+  return enriched
+
+
+def _enrich_portfolios_payload(payload: object) -> object:
+  if not isinstance(payload, dict):
+    return payload
+  enriched = dict(payload)
+  meta = dict(enriched.get("meta") or {})
+  units = dict(meta.get("units") or {})
+  units.update({
+    "is_current_week_partial": engine._CACHE.get("is_week_partial", False) if hasattr(engine, "_CACHE") else False,
+    "weekly_last_label": engine._CACHE.get("weekly_last_label") if hasattr(engine, "_CACHE") else None,
+    "weekly_last_observed": engine._CACHE.get("weekly_last_observed") if hasattr(engine, "_CACHE") else None,
+  })
+  meta["units"] = units
+  enriched["meta"] = meta
+  return enriched
+
+
 def _read_json_cache(path: str) -> object | None:
   try:
     with open(path, "r", encoding="utf-8") as handle:
@@ -71,9 +107,10 @@ def scatter():
   cache_path = os.path.join(CACHE_DIR, "scatter.json")
   cached = _read_json_cache(cache_path)
   if cached is not None:
-    return jsonify(cached)
+    return jsonify(_enrich_scatter_payload(cached))
   items = engine.get_scatter_data()
-  payload = {"count": len(items), "items": items}
+  payload = {"count": len(items), "items": items, "meta": engine.get_scatter_meta()}
+  payload = _enrich_scatter_payload(payload)
   payload = _attach_metadata(payload, "runtime")
   _write_json_atomic(cache_path, payload)
   return jsonify(payload)
@@ -114,7 +151,7 @@ def portfolios():
   if not debug:
     cached = _read_json_cache(cache_path)
     if cached is not None:
-      return jsonify(cached)
+      return jsonify(_enrich_portfolios_payload(cached))
 
   # Forward debug kwargs when supported; keep backward compatibility otherwise.
   kwargs = {"debug": int(debug), "debug_code": debug_code}
@@ -122,6 +159,7 @@ def portfolios():
     payload = engine.get_portfolios(strategy=strategy, score=score, **kwargs)
   except TypeError:
     payload = engine.get_portfolios(strategy=strategy, score=score)
+  payload = _enrich_portfolios_payload(payload)
   payload = _attach_metadata(payload, "runtime")
   if not debug:
     _write_json_atomic(cache_path, payload)
