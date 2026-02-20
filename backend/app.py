@@ -46,7 +46,19 @@ def _enrich_scatter_payload(payload: object) -> object:
     return payload
   enriched = dict(payload)
   base_meta = dict(enriched.get("meta") or {})
-  base_meta.update(_weekly_meta_from_cache())
+  weekly_meta = _weekly_meta_from_cache()
+  for key, value in weekly_meta.items():
+    if key == "is_current_week_partial":
+      base_meta[key] = bool(value)
+      continue
+    if value is not None:
+      base_meta[key] = value
+  if base_meta.get("data_as_of") is None:
+    base_meta["data_as_of"] = base_meta.get("data_asof")
+  if base_meta.get("freq") is None:
+    base_meta["freq"] = "weekly"
+  if base_meta.get("return_unit") is None:
+    base_meta["return_unit"] = "simple_52w"
   enriched["meta"] = base_meta
   return enriched
 
