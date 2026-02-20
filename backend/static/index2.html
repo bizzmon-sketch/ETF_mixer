@@ -178,8 +178,13 @@
         <div class="card">
           <div class="card-header d-flex flex-wrap gap-2 align-items-center justify-content-between">
             <div>
-              <div class="fw-bold">변동성(x) · 수익률(y) 산점도</div>
-              <div class="small-muted">회색: 개별 ETF · 별: 리스크 구간별 혼합 포트폴리오 · 점 클릭 시 상세보기</div>
+              <div class="fw-bold">월 변동성(x)  52주 수익률(y) 산점도</div>
+              <div class="small-muted">주봉 52주 기준  회색: 개별 ETF  별: 리스크 구간별 혼합 포트폴리오  점 클릭 시 상세보기</div>
+              <div id="weekPartialBanner"
+                   class="alert alert-warning py-1 px-2 mb-0 mt-1"
+                   style="display:none; font-size:12px;">
+                이번 주 데이터 반영 중 (당주 미완성  부분 데이터)
+              </div>
             </div>
             <div class="d-flex gap-2 align-items-center">
               <span class="tag tag-demo">DEMO</span>
@@ -254,7 +259,7 @@
               </div>
 
               <div class="price-panel">
-                <div class="fw-bold">최근 120일 종가</div>
+                <div class="fw-bold">최근 종가 추이</div>
                 <div class="small-muted" id="priceStatus">ETF를 선택하면 가격 추이가 표시됩니다.</div>
                 <div id="priceChart"></div>
               </div>
@@ -473,18 +478,20 @@
     }
 
     function explainItem(item) {
-      return `${item.Name} (${item.Code})의 최근 6개월 수익률과 월 변동성 위치를 요약한 포인트입니다.`;
+      return `${item.Name} (${item.Code})의 52주 수익률(주봉 기준)과 월 변동성 위치입니다.`;
     }
 
     function getReturnRatio(item) {
       if (!item) return null;
+      if (item.return_52w !== undefined && item.return_52w !== null) return item.return_52w;
       if (item.return_120d !== undefined && item.return_120d !== null) return item.return_120d;
       return item.return_6m;
     }
 
     function getReturnLabel(item) {
+      if (item && item.return_52w !== undefined && item.return_52w !== null) return '52주 수익률';
       if (item && item.return_120d !== undefined && item.return_120d !== null) return '120일 수익률';
-      return '6개월 수익률';
+      return '52주 수익률';
     }
 
     function renderRecommendCards() {
@@ -551,8 +558,10 @@
       document.getElementById('metricReturnLabel').textContent = getReturnLabel(item);
       document.getElementById('metricReturn').textContent = fmtPctFromRatioSafe(getReturnRatio(item), 1);
       document.getElementById('metricVol').textContent = fmtPct(item.risk_pct, 2);
-      if (item.sharpe_120d !== undefined && item.sharpe_120d !== null && !Number.isNaN(item.sharpe_120d)) {
-        document.getElementById('metricSharpe').textContent = Number(item.sharpe_120d).toFixed(2);
+      const sharpeVal = (item.sharpe_52w_ann !== undefined && item.sharpe_52w_ann !== null)
+        ? item.sharpe_52w_ann : item.sharpe_120d;
+      if (sharpeVal !== undefined && sharpeVal !== null && !Number.isNaN(Number(sharpeVal))) {
+        document.getElementById('metricSharpe').textContent = Number(sharpeVal).toFixed(2);
       } else {
         document.getElementById('metricSharpe').textContent = '-';
       }
@@ -755,9 +764,11 @@
 
     function renderPlot() {
       const series = buildPlotTraces();
+      const hasReturn52w = state.scatterItems.some((item) => item.return_52w !== undefined && item.return_52w !== null)
+        || state.portfolios.some((item) => item.return_52w !== undefined && item.return_52w !== null);
       const hasReturn120d = state.scatterItems.some((item) => item.return_120d !== undefined && item.return_120d !== null)
         || state.portfolios.some((item) => item.return_120d !== undefined && item.return_120d !== null);
-      const yTitle = hasReturn120d ? '120일 수익률 (%)' : '6개월 수익률 (%)';
+      const yTitle = hasReturn52w ? '52주 수익률 (%) [주봉]' : (hasReturn120d ? '120일 수익률 (%)' : '52주 수익률 (%)');
       const grid = isMobile
         ? { left: 28, right: 10, top: 12, bottom: 38, containLabel: true }
         : { left: 54, right: 14, top: 12, bottom: 44, containLabel: true };
@@ -830,7 +841,7 @@
             left: (typeof grid.left === 'number' ? grid.left : 0) + 6,
             top: (typeof grid.top === 'number' ? grid.top : 0) + 4,
             style: {
-              text: '120일 수익률(%)',
+              text: hasReturn52w ? '52주 수익률(%) [주봉]' : '120일 수익률(%)',
               fill: 'rgba(17, 24, 39, 0.7)',
               fontSize: isMobile ? 11 : 12,
               fontWeight: 500,
@@ -1291,6 +1302,11 @@
       ]);
 
       state.scatterItems = Array.isArray(scatter.items) ? scatter.items : [];
+      const partialBanner = document.getElementById('weekPartialBanner');
+      if (partialBanner) {
+        partialBanner.style.display =
+          (scatter.meta && scatter.meta.is_current_week_partial) ? '' : 'none';
+      }
       state.portfolios = (Array.isArray(portfolios.items) ? portfolios.items : [])
         .filter((item) => {
           const bucket = String(item.risk_bucket || '');
