@@ -524,30 +524,70 @@ def select_best_by_bucket(metrics: pd.DataFrame) -> pd.DataFrame:
   return best.reset_index(drop=True)
 
 
-def classify_asset_class(name: str) -> str:
+def classify_asset_class(name: str) -> str:  # noqa: PLR0911
+  """ETF 종목명으로 자산 클래스를 분류한다.
+
+  우선순위:
+    1. 커버드콜 전용 (기초자산이 채권이면 Bond, 아니면 Equity)
+    2. CashLike  - 단기 현금성 (머니마켓, KOFR, CD금리, 단기채권 등)
+    3. Alt       - 실물자산리츠상품선물 (골드선물, 리츠, 원유선물 등)
+    4. Bond      - 채권국채회사채
+    5. Equity    - 나머지 (주식)
+
+  기존 단음절 키워드("콜","금","은","단기") 제거로 오분류 60건+ 수정:
+    - 커버드콜 ETF 28개: CashLike  Equity/Bond
+    - 금융주은행주  6개: Alt  Equity
+    - SOFRCD금리  11개: Alt  CashLike
+    - 구리농산물선물 등 8개: Equity  Alt
+  """
   if not name:
     return "Equity"
   raw = str(name)
   lowered = raw.lower()
-  cashlike_lower = ["mmf", "cdbond", "kofr", "koribor", "cash"]
-  cashlike_raw = ["현금", "단기", "초단기", "머니", "콜", "통안", "단기채"]
-  alt_lower = ["reit", "commodity", "commodities"]
-  alt_raw = ["리츠", "금", "은", "원유", "원자재", "희토류"]
-  bond_lower = ["bond", "credit"]
-  bond_raw = ["채권", "국채", "회사채", "국고", "공채", "크레딧", "듀레이션"]
 
-  if any(keyword in lowered for keyword in cashlike_lower):
+  #  1순위: 커버드콜 전용 규칙
+  if "커버드콜" in raw:
+    _bond_kw_lower = ["bond", "credit"]
+    _bond_kw_raw   = ["채권", "국채", "회사채"]
+    if any(k in lowered for k in _bond_kw_lower) or any(k in raw for k in _bond_kw_raw):
+      return "Bond"
+    return "Equity"
+
+  #  2순위: CashLike
+  cashlike_lower = ["mmf", "kofr", "koribor", "sofr"]
+  cashlike_raw   = [
+    "머니마켓", "단기통안채", "단기자금", "CD금리", "CD1년금리",
+    "단기변동금리", "초단기채권", "초단기국채", "통안채",
+  ]
+  if any(k in lowered for k in cashlike_lower):
     return "CashLike"
-  if any(keyword in raw for keyword in cashlike_raw):
+  if any(k in raw for k in cashlike_raw):
     return "CashLike"
-  if any(keyword in lowered for keyword in alt_lower):
+  if "단기채권" in raw and not any(x in raw for x in ["달러", "미국", "해외", "선진국"]):
+    return "CashLike"
+
+  #  3순위: Alt
+  alt_lower = ["reit", "commodity", "commodities", "gold", "silver"]
+  alt_raw   = [
+    "리츠", "골드선물", "금선물", "금현물", "실물금", "금채굴", "금은선물",
+    "은선물", "실물은", "원유선물", "원유에너지", "구리선물", "구리실물",
+    "농산물선물", "3대농산물", "탄소배출권", "달러선물", "엔선물",
+    "희토류", "원자재",
+  ]
+  if any(k in lowered for k in alt_lower):
     return "Alt"
-  if any(keyword in raw for keyword in alt_raw):
+  if any(k in raw for k in alt_raw):
     return "Alt"
-  if any(keyword in lowered for keyword in bond_lower):
+
+  #  4순위: Bond
+  bond_lower = ["bond", "credit"]
+  bond_raw   = ["채권", "국채", "회사채", "국고채", "공채", "크레딧", "듀레이션"]
+  if any(k in lowered for k in bond_lower):
     return "Bond"
-  if any(keyword in raw for keyword in bond_raw):
+  if any(k in raw for k in bond_raw):
     return "Bond"
+
+  #  5순위: Equity
   return "Equity"
 
 
