@@ -163,7 +163,12 @@ def portfolios():
   if not debug:
     cached = _read_json_cache(cache_path)
     if cached is not None:
-      return jsonify(_enrich_portfolios_payload(cached))
+      if strategy == "qp":
+        has_dual = isinstance(cached, dict) and isinstance(cached.get("base"), list) and isinstance(cached.get("delta"), list)
+        if not has_dual:
+          cached = None
+      if cached is not None:
+        return jsonify(_enrich_portfolios_payload(cached))
 
   # Forward debug kwargs when supported; keep backward compatibility otherwise.
   kwargs = {"debug": int(debug), "debug_code": debug_code}

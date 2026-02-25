@@ -45,8 +45,6 @@ RISK_BUCKETS: List[Tuple[float, float, str]] = [
   (0.0, 3.0, "0-3%"),
   (3.0, 6.0, "3-6%"),
   (6.0, 9.0, "6-9%"),
-  (9.0, 12.0, "9-12%"),
-  (12.0, 15.0, "12-15%"),
 ]
 RISK_BUCKET_LABELS = [label for _, _, label in RISK_BUCKETS] + ["15%+"]
 ASSET_CLASSES = ["Equity", "Bond", "Alt", "CashLike"]
@@ -58,6 +56,7 @@ _CACHE: Dict[str, object] = {
   "metrics": None,
   "recommendations": None,
   "delta3m": None,
+  "sharpe_13w": None,
   "returns_tail": None,
   "refresh_mode": None,
   "cached_at": None,
@@ -513,6 +512,42 @@ def compute_delta3m(close: pd.DataFrame) -> pd.DataFrame:
   return pd.DataFrame.from_records(records)
 
 
+def compute_sharpe_13w_ago(
+  close: pd.DataFrame,
+  weekly_window: int = 52,
+) -> pd.Series:
+  """
+  13주 전 기준으로 과거 52주 sharpe를 계산한다.
+  returns: Series(index=Code, value=sharpe_13w_ago)
+  """
+  if close.empty:
+    return pd.Series(dtype=float)
+  end_old = close.index.max() - pd.DateOffset(weeks=13)
+  start_old = end_old - pd.DateOffset(weeks=weekly_window)
+  close_old = close.loc[
+    (close.index >= start_old) & (close.index <= end_old)
+  ]
+  if len(close_old) < 20:
+    return pd.Series(dtype=float)
+
+  weekly_old = close_old.resample("W-FRI").last().dropna(how="all")
+  log_ret_old = np.log(weekly_old / weekly_old.shift(1)).dropna(how="all")
+
+  scale = np.sqrt(52 / 12)
+  result = {}
+  for code in log_ret_old.columns:
+    s = log_ret_old[code].dropna()
+    if len(s) < 20:
+      continue
+    std = float(s.std())
+    if std < 1e-9:
+      continue
+    mu = float(s.mean()) * 52
+    sharpe = mu / (std * scale)
+    result[code] = sharpe
+  return pd.Series(result)
+
+
 def select_best_by_bucket(metrics: pd.DataFrame) -> pd.DataFrame:
   if metrics.empty:
     return pd.DataFrame(columns=["Code", "Name", "return_6m", "risk_6m", "risk_pct", "risk_bucket"])
@@ -845,6 +880,7 @@ def _refresh_cache_from_db() -> None:
   metrics = compute_metrics(etf_df, close, returns_tail=returns_tail)
   recommendations = select_best_by_bucket(metrics)
   delta3m = compute_delta3m(close)
+  sharpe_13w = compute_sharpe_13w_ago(close)
 
   cached_at = _now_kst()
   _CACHE["timestamp"] = time.time()
@@ -857,6 +893,7 @@ def _refresh_cache_from_db() -> None:
   _CACHE["metrics"] = metrics
   _CACHE["recommendations"] = recommendations
   _CACHE["delta3m"] = delta3m
+  _CACHE["sharpe_13w"] = sharpe_13w
   _CACHE["returns_tail"] = returns_tail
 
 
@@ -1093,7 +1130,7 @@ def _estimate_feasible_min_risk_est(
       row = next((item for item in holdings_rows if str(item.get("Code")) == code), None)
       if row is None:
         continue
-      cap = 0.4 if row.get("asset_class") == "CashLike" else 0.3
+      cap = 0.4
       room = cap - weights[code]
       if room <= 1e-10:
         continue
@@ -1392,6 +1429,7 @@ def _qp_solve_weights(
   mu: np.ndarray,
   sigma: np.ndarray,
   gamma: float,
+  lower_bounds: np.ndarray | None = None,
   upper_bounds: np.ndarray | None = None,
   solver: str | None = None,
   risk_cap_pct: float | None = None,
@@ -1420,10 +1458,16 @@ def _qp_solve_weights(
   diag["n"] = n
   diag["gamma"] = _to_json_float(gamma)
   diag["has_upper_bounds"] = _to_json_bool(upper_bounds is not None)
+  diag["has_lower_bounds"] = _to_json_bool(lower_bounds is not None)
+  if lower_bounds is not None:
+    lower_arr = np.array(lower_bounds, dtype=float).flatten()
+  else:
+    lower_arr = None
   if upper_bounds is not None:
     upper_arr = np.array(upper_bounds, dtype=float).flatten()
   else:
     upper_arr = None
+  diag["sum_lower_bounds"] = _to_json_float(np.sum(lower_arr)) if lower_arr is not None and lower_arr.size else None
   diag["sum_upper_bounds"] = _to_json_float(np.sum(upper_arr)) if upper_arr is not None and upper_arr.size else None
   diag["risk_cap_pct"] = _to_json_float(risk_cap_pct)
   diag["scale_to_monthly"] = _to_json_float(scale_to_monthly)
@@ -1438,6 +1482,8 @@ def _qp_solve_weights(
   diag["sigma_has_inf"] = bool(np.isinf(sigma_arr).any()) if sigma_arr.size else False
   diag["upper_bounds_has_nan"] = bool(np.isnan(upper_arr).any()) if upper_arr is not None and upper_arr.size else False
   diag["upper_bounds_has_inf"] = bool(np.isinf(upper_arr).any()) if upper_arr is not None and upper_arr.size else False
+  diag["lower_bounds_has_nan"] = bool(np.isnan(lower_arr).any()) if lower_arr is not None and lower_arr.size else False
+  diag["lower_bounds_has_inf"] = bool(np.isinf(lower_arr).any()) if lower_arr is not None and lower_arr.size else False
 
   if n == 0:
     diag["fail_reason"] = "no_solution"
@@ -1448,11 +1494,16 @@ def _qp_solve_weights(
   if upper_arr is not None and upper_arr.size != n:
     diag["fail_reason"] = "shape_error"
     return None, diag
+  if lower_arr is not None and lower_arr.size != n:
+    diag["fail_reason"] = "shape_error"
+    return None, diag
   if (
     diag["mu_has_nan"]
     or diag["mu_has_inf"]
     or diag["sigma_has_nan"]
     or diag["sigma_has_inf"]
+    or diag["lower_bounds_has_nan"]
+    or diag["lower_bounds_has_inf"]
     or diag["upper_bounds_has_nan"]
     or diag["upper_bounds_has_inf"]
   ):
@@ -1498,6 +1549,8 @@ def _qp_solve_weights(
     w = cp.Variable(n, nonneg=True)
     objective = cp.Maximize(mu_arr @ w - float(gamma) * cp.quad_form(w, sigma_qp))
     constraints = [cp.sum(w) == 1]
+    if lower_arr is not None:
+      constraints.append(w >= lower_arr)
     if upper_arr is not None:
       constraints.append(w <= upper_arr)
     if risk_cap_pct is not None and scale_to_monthly is not None and scale_to_monthly > 0:
@@ -1674,11 +1727,141 @@ def _select_qp_holdings_topk(
   return selected, truncated
 
 
-def _generate_portfolios_qp(
+def _soft_select_after_quantize(
+  holdings_rows: List[Dict[str, object]],
+  selected_rows: List[Dict[str, object]],
+  selected_weights: np.ndarray,
+  best_weight_by_code: Dict[str, float],
+  min_weight: float,
+  primary_count: int = 5,
+  fallback_count: int = 4,
+) -> Tuple[List[Dict[str, object]], np.ndarray, int, int] | None:
+  if not selected_rows or len(selected_rows) != len(selected_weights):
+    return None
+  code_to_row = {str(row["Code"]): row for row in holdings_rows}
+  rank_rows = sorted(
+    holdings_rows,
+    key=lambda row: (
+      -float(row.get("qp_score", 0.0)),
+      -float(best_weight_by_code.get(str(row["Code"]), 0.0)),
+      str(row["Code"]),
+    ),
+  )
+  base_weight_by_code = {
+    str(row["Code"]): float(weight)
+    for row, weight in zip(selected_rows, selected_weights)
+    if float(weight) > 1e-12
+  }
+  if not base_weight_by_code:
+    return None
+
+  def _try_target(target_count: int) -> Tuple[List[Dict[str, object]], np.ndarray, int] | None:
+    ranked_by_weight = sorted(
+      base_weight_by_code.items(),
+      key=lambda kv: (-float(kv[1]), -float(code_to_row[kv[0]].get("qp_score", 0.0)), kv[0]),
+    )
+    if len(ranked_by_weight) < target_count:
+      return None
+
+    chosen_codes = [code for code, _ in ranked_by_weight[:target_count]]
+    chosen_set = set(chosen_codes)
+    swap_count = 0
+
+    for _ in range(24):
+      class_map: Dict[str, List[str]] = {}
+      for code in chosen_codes:
+        asset_class = str(code_to_row[code].get("asset_class", "Equity"))
+        class_map.setdefault(asset_class, []).append(code)
+      offender = next((ac for ac, codes in class_map.items() if len(codes) >= 3), None)
+      if offender is None:
+        break
+
+      offender_codes = class_map[offender]
+      drop_code = sorted(
+        offender_codes,
+        key=lambda c: (
+          float(code_to_row[c].get("qp_score", 0.0)),
+          float(base_weight_by_code.get(c, 0.0)),
+          c,
+        ),
+      )[0]
+
+      replacement_code = None
+      for candidate in rank_rows:
+        cand_code = str(candidate["Code"])
+        if cand_code in chosen_set:
+          continue
+        cand_class = str(candidate.get("asset_class", "Equity"))
+        if len(class_map.get(cand_class, [])) >= 2:
+          continue
+        replacement_code = cand_code
+        break
+      if replacement_code is None:
+        return None
+
+      chosen_set.remove(drop_code)
+      chosen_set.add(replacement_code)
+      chosen_codes = [replacement_code if c == drop_code else c for c in chosen_codes]
+      if replacement_code not in base_weight_by_code:
+        base_weight_by_code[replacement_code] = max(float(best_weight_by_code.get(replacement_code, 0.0)), min_weight)
+      swap_count += 1
+
+    weight_seed = np.array(
+      [max(float(base_weight_by_code.get(code, 0.0)), 0.0) for code in chosen_codes],
+      dtype=float,
+    )
+    weight_seed = _normalize_weights(weight_seed)
+    lower_bounds = np.full(target_count, float(min_weight), dtype=float)
+    upper_bounds = np.full(target_count, 0.4, dtype=float)
+    projected = _project_weights_with_bounds(weight_seed, lower_bounds, upper_bounds)
+    if projected is None:
+      return None
+    snapped = _quantize_5pct(projected, upper_bounds, step=0.05)
+    if snapped is None:
+      return None
+    snapped = _normalize_weights(snapped)
+    out_rows = [code_to_row[code] for code in chosen_codes]
+    return out_rows, snapped, swap_count
+
+  primary = _try_target(primary_count)
+  if primary is not None:
+    rows_out, weights_out, swap_count = primary
+    return rows_out, weights_out, primary_count, swap_count
+  fallback = _try_target(fallback_count)
+  if fallback is None:
+    return None
+  rows_out, weights_out, swap_count = fallback
+  return rows_out, weights_out, fallback_count, swap_count
+
+
+def _portfolio_adequacy_meta(
+  rows: List[Dict[str, object]],
+  weights: np.ndarray,
+  portfolio_risk_pct: float | None,
+) -> Dict[str, object]:
+  weights_arr = [float(w) for w in np.array(weights, dtype=float).tolist() if float(w) > 1e-12]
+  herfindahl = float(sum(w * w for w in weights_arr)) if weights_arr else None
+  n_assets = int(len(weights_arr))
+  risk_weighted = 0.0
+  for row, w in zip(rows, weights):
+    risk_weighted += float(w) * float(row.get("risk_pct") or 0.0)
+  if portfolio_risk_pct is not None and portfolio_risk_pct > 1e-9:
+    diversification_ratio = float(risk_weighted / float(portfolio_risk_pct))
+  else:
+    diversification_ratio = None
+  return {
+    "herfindahl": herfindahl,
+    "n_assets": n_assets,
+    "diversification_ratio": diversification_ratio,
+  }
+
+
+def build_portfolio_qp(
   metrics: pd.DataFrame,
   config: Dict[str, object],
   returns_tail: pd.DataFrame | None,
   score_mode: str,
+  mode: str = "base",
   debug: bool = False,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
   try:
@@ -1696,7 +1879,8 @@ def _generate_portfolios_qp(
   except Exception:
     cov_shrink_alpha = 0.0
   meta = {
-    "version": "qp-v2",
+    "version": "qp-v3",
+    "mode": mode,
     "topN_by_class": topn_config,
     "freq": scaling_policy["freq"],
     "window_periods": scaling_policy["window_periods"],
@@ -1705,7 +1889,7 @@ def _generate_portfolios_qp(
     "scale_to_monthly": scaling_policy["scale_to_monthly"],
     "cov_shrink_alpha": cov_shrink_alpha,
     "solver_available": solver_available,
-    "score_mode": "sharpe",
+    "score_mode": "delta" if mode == "delta" else "sharpe",
     "sharpe_window": scaling_policy["window_periods"],
     "alignment_policy": "intersection",
     "alignment_n_dates": 0,
@@ -1716,9 +1900,9 @@ def _generate_portfolios_qp(
 
   pools = _build_candidate_pools(metrics, config)
   by_class_counts = {asset_class: len(pools.get(asset_class, [])) for asset_class in ASSET_CLASSES}
-  required_classes = [asset_class for asset_class in ASSET_CLASSES if by_class_counts[asset_class] > 0]
-  relaxed_classes = [asset_class for asset_class in ASSET_CLASSES if by_class_counts[asset_class] == 0]
-  feasible_before = int(1 if len(relaxed_classes) == 0 else 0)
+  required_classes: List[str] = []
+  relaxed_classes: List[str] = []
+  feasible_before = 1
   meta["universe_counts"] = by_class_counts
 
   holdings_rows: List[Dict[str, object]] = []
@@ -1773,7 +1957,7 @@ def _generate_portfolios_qp(
 
   items: List[Dict[str, object]] = []
   max_holdings = min(int(CONFIG["portfolio_max_holdings"]), 10)
-  min_weight = 0.05
+  min_weight = 0.10
   feasible_min_risk_est = _estimate_feasible_min_risk_est(
     holdings_rows,
     required_classes,
@@ -1952,15 +2136,27 @@ def _generate_portfolios_qp(
       meta["qp_audit"] = qp_audit
     return items, meta
 
-  # P0-2: mu는 주봉 log 기반 연환산 기대수익(선형 결합 자연스러움)
-  mu = np.array(
-    [float(h.get("mean_log_r_ann") or 0.0) for h in holdings_rows],
-    dtype=float,
-  )
-  upper_bounds = np.array(
-    [0.4 if h["asset_class"] == "CashLike" else 0.3 for h in holdings_rows],
-    dtype=float,
-  )
+  sharpe_13w_cache = _CACHE.get("sharpe_13w")
+  if isinstance(sharpe_13w_cache, pd.Series):
+    sharpe_13w = sharpe_13w_cache.to_dict()
+  elif isinstance(sharpe_13w_cache, dict):
+    sharpe_13w = sharpe_13w_cache
+  else:
+    sharpe_13w = {}
+  if mode == "delta":
+    for row in holdings_rows:
+      code = str(row.get("Code") or "")
+      s_now = float(row.get("sharpe_window") or 0.0)
+      s_old = float(sharpe_13w.get(code, s_now))
+      delta = s_now - s_old
+      risk_floor = max(float(row.get("risk_pct") or 0.0), 2.0)
+      row["qp_score"] = s_now + 0.5 * (delta / risk_floor)
+    mu = np.array([float(h.get("qp_score") or 0.0) for h in holdings_rows], dtype=float)
+  else:
+    for row in holdings_rows:
+      row["qp_score"] = float(row.get("mean_log_r_ann") or 0.0)
+    mu = np.array([float(h.get("mean_log_r_ann") or 0.0) for h in holdings_rows], dtype=float)
+  upper_bounds = np.full(len(holdings_rows), 0.4, dtype=float)
   default_solvers = _qp_default_solvers(cvxpy) if cvxpy is not None else ["ECOS", "OSQP", "SCS"]
 
   # 버킷별 gamma 테이블 (고위험 버킷 = 낮은 gamma)
@@ -2009,6 +2205,9 @@ def _generate_portfolios_qp(
       mu,
       sigma,
       gamma,
+      lower_bounds=np.full(len(holdings_rows), min_weight, dtype=float)
+      if len(holdings_rows) <= int(round(1.0 / min_weight))
+      else None,
       upper_bounds=upper_bounds,
       risk_cap_pct=bucket_hi_v,
       scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
@@ -2104,10 +2303,7 @@ def _generate_portfolios_qp(
 
     selected_rows = [holdings_rows[idx] for idx in selected_indices]
     selected_codes = [h["Code"] for h in selected_rows]
-    upper_selected = np.array(
-      [0.4 if h["asset_class"] == "CashLike" else 0.3 for h in selected_rows],
-      dtype=float,
-    )
+    upper_selected = np.full(len(selected_rows), 0.4, dtype=float)
     sel_sigma_idx = [codes.index(c) for c in selected_codes]
     sel_sigma = sigma[np.ix_(sel_sigma_idx, sel_sigma_idx)]
 
@@ -2157,9 +2353,18 @@ def _generate_portfolios_qp(
     fallback_used = not feasible_in_band
     fallback_reason = "" if feasible_in_band else "repair_swap_exhausted"
 
-    # STEP 5: 최종 정리
-    positive_idx = [i for i, ww in enumerate(w_final.tolist()) if float(ww) > 1e-9]
-    if not positive_idx:
+    # STEP 5: 최종 정리 (상위 5종목 고정, 불가 시 4종목)
+    best_weight_by_code = {codes[i]: float(best_weights[i]) for i in range(len(codes))}
+    post_processed = _soft_select_after_quantize(
+      holdings_rows,
+      selected_rows,
+      w_final,
+      best_weight_by_code,
+      min_weight=min_weight,
+      primary_count=5,
+      fallback_count=4,
+    )
+    if post_processed is None:
       items.append({
         "risk_bucket": bucket_label, "risk_pct": None, "return_6m": None,
         "holdings": [], "error": "postprocess_zero",
@@ -2172,9 +2377,8 @@ def _generate_portfolios_qp(
         },
       })
       continue
-
-    final_weights = _normalize_weights(w_final[positive_idx])
-    final_rows_out = [selected_rows[i] for i in positive_idx]
+    final_rows_out, final_weights, fixed_count, class_swap_count = post_processed
+    quantize_method = f"{quantize_method}|top{fixed_count}"
     weights_pct = _format_weight_percentages(final_weights, decimals=2)
 
     final_classes = {h["asset_class"] for h in final_rows_out}
@@ -2197,8 +2401,8 @@ def _generate_portfolios_qp(
       })
     holdings_output = sorted(holdings_output, key=lambda h: (-h["weight"], h["Code"]))
 
-    # 최종 리스크/샤프 (positive_idx 기준 sigma 재추출)
-    pos_sigma_idx = [sel_sigma_idx[i] for i in positive_idx]
+    # 최종 리스크/샤프 (최종 종목 기준 sigma 재추출)
+    pos_sigma_idx = [codes.index(str(h["Code"])) for h in final_rows_out]
     pos_sigma = sigma[np.ix_(pos_sigma_idx, pos_sigma_idx)]
     final_risk = _portfolio_risk_pct(
       final_weights, pos_sigma,
@@ -2210,10 +2414,11 @@ def _generate_portfolios_qp(
       final_weights,
       periods_per_year=int(scaling_policy["periods_per_year"]),
     )
+    adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
 
     # final_hash (버킷 간 중복 감지)
     final_hash = _compute_final_hash(
-      w_final[positive_idx],
+      final_weights,
       [h["Code"] for h in final_rows_out],
     )
     if final_hash in bucket_hashes.values():
@@ -2244,6 +2449,8 @@ def _generate_portfolios_qp(
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
         "quantize_method": quantize_method,
+        "fixed_holdings_count": fixed_count,
+        "class_soft_swaps": class_swap_count,
         "repair_steps": repair_diag["repair_steps"],
         "final_hash": final_hash,
         "duplicate_warning": dup_warning,
@@ -2282,9 +2489,12 @@ def _generate_portfolios_qp(
         "hi": bucket["max"],
         "achieved_risk_pct": _to_json_float(final_risk),
         "quantize_method": quantize_method,
+        "fixed_holdings_count": fixed_count,
+        "class_soft_swaps": class_swap_count,
         "repair_steps": repair_diag["repair_steps"],
         "final_hash": final_hash,
         "duplicate_warning": dup_warning,
+        **adequacy_meta,
         "constraints": constraints_meta,
       },
     })
@@ -2315,6 +2525,23 @@ def _generate_portfolios_qp(
     meta["qp_audit"] = qp_audit
 
   return items, meta
+
+
+def _generate_portfolios_qp(
+  metrics: pd.DataFrame,
+  config: Dict[str, object],
+  returns_tail: pd.DataFrame | None,
+  score_mode: str,
+  debug: bool = False,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+  return build_portfolio_qp(
+    metrics,
+    config,
+    returns_tail,
+    score_mode,
+    mode="base",
+    debug=debug,
+  )
 
 
 def _sample_holding(rng: random.Random, pool: List[Dict[str, object]], used: set[str]) -> Dict[str, object] | None:
@@ -2801,17 +3028,34 @@ def generate_portfolios(
       },
     )
 
+  base_items: List[Dict[str, object]] | None = None
+  delta_items: List[Dict[str, object]] | None = None
+  base_meta: Dict[str, object] | None = None
+  delta_meta: Dict[str, object] | None = None
+
   if strategy == "sampled":
     items, meta = _generate_portfolios_sampled(metrics, default_config, returns_tail, score_mode)
   elif strategy == "qp":
     score_mode = "sharpe"
-    items, meta = _generate_portfolios_qp(
+    base_items, base_meta = build_portfolio_qp(
       metrics,
       default_config,
       returns_tail,
       score_mode,
+      mode="base",
       debug=bool(debug),
     )
+    delta_items, delta_meta = build_portfolio_qp(
+      metrics,
+      default_config,
+      returns_tail,
+      score_mode,
+      mode="delta",
+      debug=bool(debug),
+    )
+    items = list(base_items)
+    meta = dict(base_meta or {})
+    meta["delta"] = delta_meta or {}
   elif strategy == "grid":
     items, meta = _generate_portfolios_grid(metrics, default_config)
   elif strategy == "bucket_fallback":
@@ -2861,7 +3105,13 @@ def generate_portfolios(
     if meta.get("debug_warning"):
       qp_audit["warning"] = str(meta["debug_warning"])
     meta["qp_audit"] = qp_audit
-  return format_portfolios(items, strategy, meta)
+  payload = format_portfolios(items, strategy, meta)
+  if strategy == "qp":
+    payload["base"] = base_items or items
+    payload["delta"] = delta_items or []
+    payload["items"] = payload["base"]
+    payload["count"] = len(payload["items"])
+  return payload
 
 
 def format_portfolios(
