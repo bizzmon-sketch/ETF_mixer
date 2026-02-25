@@ -17,7 +17,7 @@ import FinanceDataReader as fdr
 CONFIG = {
   "etf_list_path": "data/etf_list.csv",
   "price_db_path": "data/prices.sqlite",
-  "months": 15,
+  "months": 24,
   "min_observations": 90,
   "trading_days_month": 21,
   "window_days": 260,
