@@ -1,0 +1,19 @@
+=== required_classes ===
+required_classes: List[str] = []
+
+=== upper_bounds ===
+upper_bounds = np.full(len(holdings_rows), 0.4, dtype=float)
+upper_bounds=upper_bounds,
+
+=== min_weight ===
+min_weight = 0.10
+min_weight=min_weight,
+lower_bounds=np.full(len(holdings_rows), min_weight, dtype=float)
+if len(holdings_rows) <= int(round(1.0 / min_weight))
+min_weight=min_weight,
+
+=== _bucket_bounds() ===
+{'label': '0-3%', 'min': 0.0, 'max': 3.0}
+{'label': '3-6%', 'min': 3.0, 'max': 6.0}
+{'label': '6-9%', 'min': 6.0, 'max': 9.0}
+{'label': '15%+', 'min': 15.0, 'max': None}
