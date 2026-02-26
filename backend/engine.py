@@ -46,7 +46,6 @@ RISK_BUCKETS: List[Tuple[float, float, str]] = [
   (3.0, 6.0, "3-6%"),
   (6.0, 9.0, "6-9%"),
 ]
-RISK_BUCKET_LABELS = [label for _, _, label in RISK_BUCKETS] + ["15%+"]
 ASSET_CLASSES = ["Equity", "Bond", "Alt", "CashLike"]
 PORTFOLIO_VERSION = "sampled-v1"
 PORTFOLIO_SEED_SALT = f"ETF_mixer|{PORTFOLIO_VERSION}"
@@ -286,7 +285,6 @@ def classify_risk(risk_pct: float) -> str | None:
     if low <= risk_pct < high:
       return label
   if risk_pct >= RISK_BUCKETS[-1][1]:
-    return "15%+"
   return None
 
 
@@ -650,7 +648,6 @@ def _allocate_portfolio_weights(
   remaining = 100 - (min_w * len(holdings))
 
   bucket_bias = 0.0
-  if bucket_label in ("12-15%", "15%+"):
     bucket_bias = 1.0
   elif bucket_label in ("9-12%", "6-9%"):
     bucket_bias = 0.5
@@ -988,7 +985,6 @@ def _bucket_bounds() -> List[Dict[str, object]]:
   bounds = []
   for low, high, label in RISK_BUCKETS:
     bounds.append({"label": label, "min": low, "max": high})
-  bounds.append({"label": "15%+", "min": 15.0, "max": None})
   return bounds
 
 
@@ -2166,7 +2162,6 @@ def build_portfolio_qp(
     "6-9%": 2.0,
     "9-12%": 1.0,
     "12-15%": 0.5,
-    "15%+": 0.25,
   }
 
   # 버킷 해시 수집 (중복 감지용)
@@ -2806,7 +2801,6 @@ def _generate_portfolios_sampled(
     "6-9%": 7.5,
     "9-12%": 10.5,
     "12-15%": 13.5,
-    "15%+": 15.6,
   }
 
   items: List[Dict[str, object]] = []
