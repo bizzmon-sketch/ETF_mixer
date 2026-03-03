@@ -35,3 +35,6 @@ backend/data/
 # generated/runtime artifacts
 data/rebuild_failed_codes.txt
 ops_notes/
+*.txt
+!README.txt
+/backend/data/cache/

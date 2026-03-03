@@ -988,7 +988,6 @@ def _bucket_bounds() -> List[Dict[str, object]]:
   bounds = []
   for low, high, label in RISK_BUCKETS:
     bounds.append({"label": label, "min": low, "max": high})
-  bounds.append({"label": "15%+", "min": 15.0, "max": None})
   return bounds
 
 
@@ -2185,15 +2184,18 @@ def build_portfolio_qp(
       "feasible_before": feasible_before,
     }
 
-    # STEP 1: QP 풀기 (연속 완화)
-    best_weights = None
-    best_risk = None
-    best_gamma = gamma
-    solver_failure_reason = None
+    fallback_attempts = [
+      {"level": 0, "min_weight": 0.10, "max_holdings": int(max_holdings), "risk_cap_scale": 1.0, "remove_asset_limit": False},
+      {"level": 1, "min_weight": 0.05, "max_holdings": int(max_holdings), "risk_cap_scale": 1.0, "remove_asset_limit": False},
+      {"level": 2, "min_weight": 0.05, "max_holdings": int(len(holdings_rows)), "risk_cap_scale": 1.0, "remove_asset_limit": True},
+      {"level": 3, "min_weight": 0.05, "max_holdings": int(len(holdings_rows)), "risk_cap_scale": 1.2, "remove_asset_limit": True},
+    ]
+
     best_solver_diag = None
     bucket_solver_attempts: List[List[object]] = []
-    last_status = None
-    chosen_solver = None
+    last_attempt_error = "postprocess_zero"
+    success_payload = None
+    used_fallback_level = 0
 
     if debug:
       logger.info(
@@ -2201,302 +2203,281 @@ def build_portfolio_qp(
         bucket_label, gamma, default_solvers,
       )
 
-    weights, solve_diag = _qp_solve_weights(
-      mu,
-      sigma,
-      gamma,
-      lower_bounds=np.full(len(holdings_rows), min_weight, dtype=float)
-      if len(holdings_rows) <= int(round(1.0 / min_weight))
-      else None,
-      upper_bounds=upper_bounds,
-      risk_cap_pct=bucket_hi_v,
-      scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
-    )
-    solve_diag["gamma"] = _to_json_float(gamma)
-    attempts = solve_diag.get("solver_attempts")
-    if isinstance(attempts, list):
-      for attempt in attempts:
-        if isinstance(attempt, dict):
-          bucket_solver_attempts.append([
-            attempt.get("solver_name"),
-            attempt.get("status"),
-            attempt.get("fail_reason"),
-          ])
-    last_status = solve_diag.get("prob.status")
-    chosen_solver = solve_diag.get("chosen_solver")
+    for attempt in fallback_attempts:
+      attempt_level = int(attempt["level"])
+      min_weight_attempt = float(attempt["min_weight"])
+      max_holdings_attempt = int(attempt["max_holdings"])
+      remove_asset_limit = bool(attempt["remove_asset_limit"])
+      risk_cap_attempt = (
+        bucket_hi_v * float(attempt["risk_cap_scale"])
+        if bucket_hi_v is not None
+        else None
+      )
 
-    if weights is None:
-      solver_failure_reason = str(solve_diag.get("fail_reason") or "solver_failed")
+      weights, solve_diag = _qp_solve_weights(
+        mu,
+        sigma,
+        gamma,
+        lower_bounds=np.full(len(holdings_rows), min_weight_attempt, dtype=float)
+        if len(holdings_rows) <= int(round(1.0 / min_weight_attempt))
+        else None,
+        upper_bounds=upper_bounds,
+        risk_cap_pct=risk_cap_attempt,
+        scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
+      )
+      solve_diag["gamma"] = _to_json_float(gamma)
+      attempts = solve_diag.get("solver_attempts")
+      if isinstance(attempts, list):
+        for attempt_item in attempts:
+          if isinstance(attempt_item, dict):
+            bucket_solver_attempts.append([
+              attempt_item.get("solver_name"),
+              attempt_item.get("status"),
+              attempt_item.get("fail_reason"),
+            ])
       best_solver_diag = solve_diag
-      # 실패 처리 (기존 코드와 동일)
-      if debug:
-        constraints_meta.update({
-          "constraints_met": False,
-          "missing_required_classes": list(required_classes),
-          "holdings_display_limit": int(max_holdings),
-          "holdings_display_truncated": False,
+
+      if weights is None:
+        last_attempt_error = str(solve_diag.get("fail_reason") or "solver_failed")
+        continue
+
+      best_weights = _normalize_weights(weights)
+      selected_indices, display_truncated = _select_qp_holdings_topk(
+        holdings_rows,
+        best_weights,
+        required_classes,
+        max_holdings=max_holdings_attempt,
+        min_weight=min_weight_attempt,
+      )
+      if not selected_indices:
+        last_attempt_error = "postprocess_empty"
+        continue
+
+      selected_rows = [holdings_rows[idx] for idx in selected_indices]
+      selected_codes = [h["Code"] for h in selected_rows]
+      upper_selected = np.full(len(selected_rows), 0.4, dtype=float)
+      sel_sigma_idx = [codes.index(c) for c in selected_codes]
+      sel_sigma = sigma[np.ix_(sel_sigma_idx, sel_sigma_idx)]
+
+      cont_w_sel = _normalize_weights(best_weights[selected_indices])
+      w_q = _quantize_5pct(cont_w_sel, upper_selected, step=0.05)
+      if w_q is None:
+        lower_bounds = np.full(len(selected_rows), min_weight_attempt, dtype=float)
+        w_q_proj = _project_weights_with_bounds(cont_w_sel, lower_bounds, upper_selected)
+        if w_q_proj is None:
+          last_attempt_error = "postprocess_infeasible"
+          continue
+        w_q = w_q_proj
+        quantize_method = "project_fallback"
+      else:
+        quantize_method = "largest_remainder_5pct"
+
+      w_final, repair_diag = _swap_repair_band(
+        w_q,
+        sel_sigma,
+        upper_selected,
+        lo_pct=bucket_lo,
+        hi_pct=risk_cap_attempt if risk_cap_attempt is not None else 99.0,
+        scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
+        max_steps=400,
+      )
+      feasible_in_band = repair_diag["repair_success"]
+      fallback_used = not feasible_in_band
+      fallback_reason = "" if feasible_in_band else "repair_swap_exhausted"
+
+      best_weight_by_code = {codes[i]: float(best_weights[i]) for i in range(len(codes))}
+      if remove_asset_limit:
+        primary_count = int(len(selected_rows))
+        fallback_count = max(1, primary_count - 1)
+      else:
+        primary_count = 5
+        fallback_count = 4
+
+      post_processed = _soft_select_after_quantize(
+        holdings_rows,
+        selected_rows,
+        w_final,
+        best_weight_by_code,
+        min_weight=min_weight_attempt,
+        primary_count=primary_count,
+        fallback_count=fallback_count,
+      )
+      if post_processed is None:
+        last_attempt_error = "postprocess_zero"
+        continue
+
+      final_rows_out, final_weights, fixed_count, class_swap_count = post_processed
+      weights_pct = _format_weight_percentages(final_weights, decimals=2)
+      holdings_output = []
+      total_return = 0.0
+      for holding, weight_pct in zip(final_rows_out, weights_pct):
+        if float(weight_pct) <= 0:
+          continue
+        total_return += (weight_pct / 100) * float(holding.get("return_6m", 0.0))
+        holdings_output.append({
+          "Code": holding["Code"],
+          "Name": holding["Name"],
+          "weight": float(weight_pct),
+          "asset_class": holding["asset_class"],
         })
-        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = solver_failure_reason
+      holdings_output = sorted(holdings_output, key=lambda h: (-h["weight"], h["Code"]))
+      if not holdings_output:
+        last_attempt_error = "postprocess_zero"
+        continue
+
+      quantize_method = f"{quantize_method}|top{fixed_count}"
+      final_classes = {h["asset_class"] for h in final_rows_out}
+      missing_required_classes = [ac for ac in required_classes if ac not in final_classes]
+      constraints_met = len(missing_required_classes) == 0
+
+      pos_sigma_idx = [codes.index(str(h["Code"])) for h in final_rows_out]
+      pos_sigma = sigma[np.ix_(pos_sigma_idx, pos_sigma_idx)]
+      final_risk = _portfolio_risk_pct(
+        final_weights, pos_sigma,
+        scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
+      )
+      final_sharpe = _compute_portfolio_sharpe_from_returns(
+        returns_slice_all,
+        [h["Code"] for h in final_rows_out],
+        final_weights,
+        periods_per_year=int(scaling_policy["periods_per_year"]),
+      )
+      adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
+
+      final_hash = _compute_final_hash(
+        final_weights,
+        [h["Code"] for h in final_rows_out],
+      )
+      if final_hash in bucket_hashes.values():
+        dup_warning = (
+          f"duplicate_solution: same hash as bucket "
+          f"{[k for k,v in bucket_hashes.items() if v == final_hash]}"
+        )
+      else:
+        dup_warning = None
+      bucket_hashes[bucket_label] = final_hash
+
+      within_bucket_flag = (
+        (final_risk is not None)
+        and (bucket_lo <= final_risk)
+        and (bucket_hi_v is None or final_risk <= bucket_hi_v)
+      )
+      constraints_meta_local = dict(constraints_meta)
+      constraints_meta_local.update({
+        "constraints_met": constraints_met,
+        "missing_required_classes": missing_required_classes,
+        "holdings_display_limit": int(max_holdings_attempt),
+        "holdings_display_truncated": bool(display_truncated),
+      })
+      success_payload = {
+        "risk_pct": final_risk,
+        "return_6m": total_return,
+        "sharpe_120d": final_sharpe,
+        "sharpe_window": final_sharpe,
+        "holdings": holdings_output,
+        "meta": {
+          "gamma": gamma,
+          "within_bucket": within_bucket_flag,
+          "feasible_in_band": feasible_in_band,
+          "fallback_used": fallback_used,
+          "fallback_reason": fallback_reason,
+          "fallback_level": attempt_level,
+          "target_risk": target_risk,
+          "feasible_min_risk_est": feasible_min_risk_est,
+          "lo": bucket["min"],
+          "hi": bucket["max"],
+          "achieved_risk_pct": _to_json_float(final_risk),
+          "quantize_method": quantize_method,
+          "fixed_holdings_count": fixed_count,
+          "class_soft_swaps": class_swap_count,
+          "repair_steps": repair_diag["repair_steps"],
+          "final_hash": final_hash,
+          "duplicate_warning": dup_warning,
+          **adequacy_meta,
+          "constraints": constraints_meta_local,
+        },
+        "audit": {
+          "solver_failure_reason": None,
+          "S5_portfolios_produced": 1,
+          "solver_diag": best_solver_diag,
+          "solver_attempts": bucket_solver_attempts,
+          "band_lo": bucket_lo,
+          "band_hi": _to_json_float(risk_cap_attempt),
+          "achieved_risk_pct": _to_json_float(final_risk),
+          "feasible_in_band": feasible_in_band,
+          "fallback_used": fallback_used,
+          "fallback_reason": fallback_reason,
+          "fallback_level": attempt_level,
+          "quantize_method": quantize_method,
+          "fixed_holdings_count": fixed_count,
+          "class_soft_swaps": class_swap_count,
+          "repair_steps": repair_diag["repair_steps"],
+          "final_hash": final_hash,
+          "duplicate_warning": dup_warning,
+        },
+      }
+      used_fallback_level = attempt_level
+      if debug:
+        logger.info(
+          "[QP] bucket=%s gamma=%.4f risk=%.4f in_band=%s fallback_level=%d",
+          bucket_label,
+          gamma,
+          final_risk or -1,
+          feasible_in_band,
+          attempt_level,
+        )
+      break
+
+    if success_payload is None:
+      constraints_meta_error = dict(constraints_meta)
+      constraints_meta_error.update({
+        "constraints_met": False,
+        "missing_required_classes": list(required_classes),
+        "holdings_display_limit": int(max_holdings),
+        "holdings_display_truncated": False,
+      })
+      if debug:
+        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = last_attempt_error
         qp_audit["buckets"][bucket_label]["solver_diag"] = best_solver_diag
         qp_audit["buckets"][bucket_label]["solver_attempts"] = bucket_solver_attempts
+        qp_audit["buckets"][bucket_label]["fallback_level"] = 3
       items.append({
         "risk_bucket": bucket_label,
         "risk_pct": None,
         "return_6m": None,
         "holdings": [],
-        "error": solver_failure_reason,
+        "error": last_attempt_error,
         "meta": {
           "gamma": gamma,
           "within_bucket": False,
           "target_risk": target_risk,
           "feasible_min_risk_est": feasible_min_risk_est,
-          "reason_category": "solver_failure",
+          "reason_category": "postprocess" if str(last_attempt_error).startswith("postprocess") else "solver_failure",
+          "fallback_level": 3,
           "lo": bucket["min"],
           "hi": bucket["max"],
-          "constraints": constraints_meta,
+          "constraints": constraints_meta_error,
         },
       })
       continue
-
-    weights = _normalize_weights(weights)
-    best_weights = weights
-    best_risk = _portfolio_risk_pct(
-      weights, sigma, scale_to_monthly=float(scaling_policy["scale_to_monthly"])
-    )
-    best_solver_diag = solve_diag
-
-    # STEP 2: TopK 선택 (기존 로직 유지)
-    selected_indices, display_truncated = _select_qp_holdings_topk(
-      holdings_rows,
-      best_weights,
-      required_classes,
-      max_holdings=max_holdings,
-      min_weight=min_weight,
-    )
-    if not selected_indices:
-      if debug:
-        constraints_meta.update({
-          "constraints_met": False,
-          "missing_required_classes": list(required_classes),
-          "holdings_display_limit": int(max_holdings),
-          "holdings_display_truncated": False,
-        })
-        qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_empty"
-        qp_audit["buckets"][bucket_label]["solver_diag"] = best_solver_diag
-        qp_audit["buckets"][bucket_label]["solver_attempts"] = bucket_solver_attempts
-      items.append({
-        "risk_bucket": bucket_label,
-        "risk_pct": None,
-        "return_6m": None,
-        "holdings": [],
-        "error": "postprocess_empty",
-        "meta": {
-          "gamma": gamma, "within_bucket": False,
-          "target_risk": target_risk,
-          "feasible_min_risk_est": feasible_min_risk_est,
-          "reason_category": "postprocess",
-          "lo": bucket["min"], "hi": bucket["max"],
-          "constraints": constraints_meta,
-        },
-      })
-      continue
-
-    selected_rows = [holdings_rows[idx] for idx in selected_indices]
-    selected_codes = [h["Code"] for h in selected_rows]
-    upper_selected = np.full(len(selected_rows), 0.4, dtype=float)
-    sel_sigma_idx = [codes.index(c) for c in selected_codes]
-    sel_sigma = sigma[np.ix_(sel_sigma_idx, sel_sigma_idx)]
-
-    # STEP 3: 5% 이산화 (Largest Remainder)
-    cont_w_sel = _normalize_weights(best_weights[selected_indices])
-    w_q = _quantize_5pct(cont_w_sel, upper_selected, step=0.05)
-
-    if w_q is None:
-      # 이산화 실패 -> 기존 _project_weights_with_bounds 로 fallback
-      lower_bounds = np.full(len(selected_rows), min_weight, dtype=float)
-      w_q_proj = _project_weights_with_bounds(cont_w_sel, lower_bounds, upper_selected)
-      if w_q_proj is None:
-        if debug:
-          qp_audit["buckets"][bucket_label]["solver_failure_reason"] = "postprocess_infeasible"
-          qp_audit["buckets"][bucket_label]["solver_diag"] = best_solver_diag
-        items.append({
-          "risk_bucket": bucket_label, "risk_pct": None, "return_6m": None,
-          "holdings": [], "error": "postprocess_infeasible",
-          "meta": {
-            "gamma": gamma, "within_bucket": False, "target_risk": target_risk,
-            "feasible_min_risk_est": feasible_min_risk_est,
-            "reason_category": "postprocess",
-            "lo": bucket["min"], "hi": bucket["max"],
-            "constraints": constraints_meta,
-          },
-        })
-        continue
-      w_q = w_q_proj
-      quantize_method = "project_fallback"
-    else:
-      quantize_method = "largest_remainder_5pct"
-
-    # STEP 4: Repair 스왑 (lo <= risk <= hi 달성)
-    w_final, repair_diag = _swap_repair_band(
-      w_q,
-      sel_sigma,
-      upper_selected,
-      lo_pct=bucket_lo,
-      hi_pct=bucket_hi_v if bucket_hi_v is not None else 99.0,
-      scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
-      max_steps=400,
-    )
-    feasible_in_band = repair_diag["repair_success"]
-    achieved_risk = repair_diag["achieved_risk_pct"]
-
-    # fallback 판단
-    fallback_used = not feasible_in_band
-    fallback_reason = "" if feasible_in_band else "repair_swap_exhausted"
-
-    # STEP 5: 최종 정리 (상위 5종목 고정, 불가 시 4종목)
-    best_weight_by_code = {codes[i]: float(best_weights[i]) for i in range(len(codes))}
-    post_processed = _soft_select_after_quantize(
-      holdings_rows,
-      selected_rows,
-      w_final,
-      best_weight_by_code,
-      min_weight=min_weight,
-      primary_count=5,
-      fallback_count=4,
-    )
-    if post_processed is None:
-      items.append({
-        "risk_bucket": bucket_label, "risk_pct": None, "return_6m": None,
-        "holdings": [], "error": "postprocess_zero",
-        "meta": {
-          "gamma": gamma, "within_bucket": False, "target_risk": target_risk,
-          "feasible_min_risk_est": feasible_min_risk_est,
-          "reason_category": "postprocess",
-          "lo": bucket["min"], "hi": bucket["max"],
-          "constraints": constraints_meta,
-        },
-      })
-      continue
-    final_rows_out, final_weights, fixed_count, class_swap_count = post_processed
-    quantize_method = f"{quantize_method}|top{fixed_count}"
-    weights_pct = _format_weight_percentages(final_weights, decimals=2)
-
-    final_classes = {h["asset_class"] for h in final_rows_out}
-    missing_required_classes = [
-      ac for ac in required_classes if ac not in final_classes
-    ]
-    constraints_met = len(missing_required_classes) == 0
-
-    holdings_output = []
-    total_return = 0.0
-    for holding, weight_pct in zip(final_rows_out, weights_pct):
-      if float(weight_pct) <= 0:
-        continue
-      total_return += (weight_pct / 100) * float(holding.get("return_6m", 0.0))
-      holdings_output.append({
-        "Code": holding["Code"],
-        "Name": holding["Name"],
-        "weight": float(weight_pct),
-        "asset_class": holding["asset_class"],
-      })
-    holdings_output = sorted(holdings_output, key=lambda h: (-h["weight"], h["Code"]))
-
-    # 최종 리스크/샤프 (최종 종목 기준 sigma 재추출)
-    pos_sigma_idx = [codes.index(str(h["Code"])) for h in final_rows_out]
-    pos_sigma = sigma[np.ix_(pos_sigma_idx, pos_sigma_idx)]
-    final_risk = _portfolio_risk_pct(
-      final_weights, pos_sigma,
-      scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
-    )
-    final_sharpe = _compute_portfolio_sharpe_from_returns(
-      returns_slice_all,
-      [h["Code"] for h in final_rows_out],
-      final_weights,
-      periods_per_year=int(scaling_policy["periods_per_year"]),
-    )
-    adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
-
-    # final_hash (버킷 간 중복 감지)
-    final_hash = _compute_final_hash(
-      final_weights,
-      [h["Code"] for h in final_rows_out],
-    )
-    if final_hash in bucket_hashes.values():
-      dup_warning = (
-        f"duplicate_solution: same hash as bucket "
-        f"{[k for k,v in bucket_hashes.items() if v == final_hash]}"
-      )
-    else:
-      dup_warning = None
-    bucket_hashes[bucket_label] = final_hash
 
     if debug:
-      constraints_meta.update({
-        "constraints_met": constraints_met,
-        "missing_required_classes": missing_required_classes,
-        "holdings_display_limit": int(max_holdings),
-        "holdings_display_truncated": bool(display_truncated),
-      })
-      qp_audit["buckets"][bucket_label].update({
-        "solver_failure_reason": None,
-        "S5_portfolios_produced": 1,
-        "solver_diag": best_solver_diag,
-        "solver_attempts": bucket_solver_attempts,
-        "band_lo": bucket_lo,
-        "band_hi": bucket_hi_v,
-        "achieved_risk_pct": _to_json_float(final_risk),
-        "feasible_in_band": feasible_in_band,
-        "fallback_used": fallback_used,
-        "fallback_reason": fallback_reason,
-        "quantize_method": quantize_method,
-        "fixed_holdings_count": fixed_count,
-        "class_soft_swaps": class_swap_count,
-        "repair_steps": repair_diag["repair_steps"],
-        "final_hash": final_hash,
-        "duplicate_warning": dup_warning,
-      })
+      qp_audit["buckets"][bucket_label].update(success_payload["audit"])
       logger.info(
-        "[QP] bucket=%s gamma=%.4f risk=%.4f in_band=%s hash=%s dup=%s",
-        bucket_label, gamma,
-        final_risk or -1,
-        feasible_in_band,
-        final_hash[:8],
-        dup_warning is not None,
+        "[QP] bucket=%s success fallback_level=%d holdings=%d",
+        bucket_label,
+        used_fallback_level,
+        len(success_payload["holdings"]),
       )
-
-    within_bucket_flag = (
-      (final_risk is not None)
-      and (bucket_lo <= final_risk)
-      and (bucket_hi_v is None or final_risk <= bucket_hi_v)
-    )
 
     items.append({
       "risk_bucket": bucket_label,
-      "risk_pct": final_risk,
-      "return_6m": total_return,
-      "sharpe_120d": final_sharpe,
-      "sharpe_window": final_sharpe,
-      "holdings": holdings_output,
-      "meta": {
-        "gamma": gamma,
-        "within_bucket": within_bucket_flag,
-        "feasible_in_band": feasible_in_band,
-        "fallback_used": fallback_used,
-        "fallback_reason": fallback_reason,
-        "target_risk": target_risk,
-        "feasible_min_risk_est": feasible_min_risk_est,
-        "lo": bucket["min"],
-        "hi": bucket["max"],
-        "achieved_risk_pct": _to_json_float(final_risk),
-        "quantize_method": quantize_method,
-        "fixed_holdings_count": fixed_count,
-        "class_soft_swaps": class_swap_count,
-        "repair_steps": repair_diag["repair_steps"],
-        "final_hash": final_hash,
-        "duplicate_warning": dup_warning,
-        **adequacy_meta,
-        "constraints": constraints_meta,
-      },
+      "risk_pct": success_payload["risk_pct"],
+      "return_6m": success_payload["return_6m"],
+      "sharpe_120d": success_payload["sharpe_120d"],
+      "sharpe_window": success_payload["sharpe_window"],
+      "holdings": success_payload["holdings"],
+      "meta": success_payload["meta"],
     })
 
   if qp_audit is not None:
