@@ -2196,6 +2196,14 @@ def build_portfolio_qp(
     last_attempt_error = "postprocess_zero"
     success_payload = None
     used_fallback_level = 0
+    fallback_rows: List[Dict[str, object]] | None = None
+    fallback_raw_weights: np.ndarray | None = None
+    fallback_max_holdings_attempt = int(max_holdings)
+    fallback_display_truncated = False
+
+    if debug:
+      qp_audit["buckets"][bucket_label]["band_lo"] = bucket_lo
+      qp_audit["buckets"][bucket_label]["band_hi"] = bucket_hi_v
 
     if debug:
       logger.info(
@@ -2260,6 +2268,10 @@ def build_portfolio_qp(
       sel_sigma = sigma[np.ix_(sel_sigma_idx, sel_sigma_idx)]
 
       cont_w_sel = _normalize_weights(best_weights[selected_indices])
+      fallback_rows = selected_rows
+      fallback_raw_weights = cont_w_sel.copy()
+      fallback_max_holdings_attempt = max_holdings_attempt
+      fallback_display_truncated = bool(display_truncated)
       w_q = _quantize_5pct(cont_w_sel, upper_selected, step=0.05)
       if w_q is None:
         lower_bounds = np.full(len(selected_rows), min_weight_attempt, dtype=float)
@@ -2384,7 +2396,7 @@ def build_portfolio_qp(
           "fallback_level": attempt_level,
           "target_risk": target_risk,
           "feasible_min_risk_est": feasible_min_risk_est,
-          "lo": bucket["min"],
+          "lo": bucket_lo,
           "hi": bucket["max"],
           "achieved_risk_pct": _to_json_float(final_risk),
           "quantize_method": quantize_method,
@@ -2428,6 +2440,139 @@ def build_portfolio_qp(
         )
       break
 
+    if (
+      success_payload is None
+      and last_attempt_error == "postprocess_zero"
+      and fallback_rows
+      and fallback_raw_weights is not None
+      and len(fallback_rows) == len(fallback_raw_weights)
+    ):
+      step = 0.05
+      rounded_weights = np.round(fallback_raw_weights / step) * step
+      rounded_weights = np.clip(rounded_weights, 0.0, None)
+      total_rounded = float(np.sum(rounded_weights))
+      if total_rounded <= 1e-12:
+        max_idx = int(np.argmax(fallback_raw_weights))
+        rounded_weights[max_idx] = 1.0
+      else:
+        max_idx = int(np.argmax(rounded_weights))
+        rounded_weights[max_idx] += float(1.0 - total_rounded)
+
+      if float(np.sum(rounded_weights)) > 1e-12 and float(np.min(rounded_weights)) >= -1e-9:
+        rounded_weights = np.clip(rounded_weights, 0.0, None)
+        rounded_weights = _normalize_weights(rounded_weights)
+
+        weights_pct = _format_weight_percentages(rounded_weights, decimals=2)
+        holdings_output = []
+        total_return = 0.0
+        for holding, weight_pct in zip(fallback_rows, weights_pct):
+          if float(weight_pct) <= 0:
+            continue
+          total_return += (weight_pct / 100) * float(holding.get("return_6m", 0.0))
+          holdings_output.append({
+            "Code": holding["Code"],
+            "Name": holding["Name"],
+            "weight": float(weight_pct),
+            "asset_class": holding["asset_class"],
+          })
+        holdings_output = sorted(holdings_output, key=lambda h: (-h["weight"], h["Code"]))
+
+        if holdings_output:
+          final_rows_out = [row for row, weight in zip(fallback_rows, rounded_weights) if float(weight) > 1e-12]
+          final_weights = np.array([float(weight) for weight in rounded_weights if float(weight) > 1e-12], dtype=float)
+          if len(final_rows_out) == len(final_weights) and len(final_rows_out) > 0:
+            final_classes = {h["asset_class"] for h in final_rows_out}
+            missing_required_classes = [ac for ac in required_classes if ac not in final_classes]
+            constraints_met = len(missing_required_classes) == 0
+
+            pos_sigma_idx = [codes.index(str(h["Code"])) for h in final_rows_out]
+            pos_sigma = sigma[np.ix_(pos_sigma_idx, pos_sigma_idx)]
+            final_risk = _portfolio_risk_pct(
+              final_weights, pos_sigma,
+              scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
+            )
+            final_sharpe = _compute_portfolio_sharpe_from_returns(
+              returns_slice_all,
+              [h["Code"] for h in final_rows_out],
+              final_weights,
+              periods_per_year=int(scaling_policy["periods_per_year"]),
+            )
+            adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
+            final_hash = _compute_final_hash(
+              final_weights,
+              [h["Code"] for h in final_rows_out],
+            )
+            if final_hash in bucket_hashes.values():
+              dup_warning = (
+                f"duplicate_solution: same hash as bucket "
+                f"{[k for k,v in bucket_hashes.items() if v == final_hash]}"
+              )
+            else:
+              dup_warning = None
+            bucket_hashes[bucket_label] = final_hash
+
+            within_bucket_flag = (
+              (final_risk is not None)
+              and (bucket_lo <= final_risk)
+              and (bucket_hi_v is None or final_risk <= bucket_hi_v)
+            )
+            constraints_meta_local = dict(constraints_meta)
+            constraints_meta_local.update({
+              "constraints_met": constraints_met,
+              "missing_required_classes": missing_required_classes,
+              "holdings_display_limit": int(fallback_max_holdings_attempt),
+              "holdings_display_truncated": bool(fallback_display_truncated),
+            })
+
+            success_payload = {
+              "risk_pct": final_risk,
+              "return_6m": total_return,
+              "sharpe_120d": final_sharpe,
+              "sharpe_window": final_sharpe,
+              "holdings": holdings_output,
+              "meta": {
+                "gamma": gamma,
+                "within_bucket": within_bucket_flag,
+                "feasible_in_band": within_bucket_flag,
+                "fallback_used": True,
+                "fallback_reason": "simple_round_fallback_from_postprocess_zero",
+                "fallback_level": 4,
+                "target_risk": target_risk,
+                "feasible_min_risk_est": feasible_min_risk_est,
+                "lo": bucket_lo,
+                "hi": bucket["max"],
+                "achieved_risk_pct": _to_json_float(final_risk),
+                "quantize_method": "simple_round_fallback",
+                "fixed_holdings_count": len(final_rows_out),
+                "class_soft_swaps": 0,
+                "repair_steps": None,
+                "final_hash": final_hash,
+                "duplicate_warning": dup_warning,
+                **adequacy_meta,
+                "constraints": constraints_meta_local,
+              },
+              "audit": {
+                "solver_failure_reason": None,
+                "S5_portfolios_produced": 1,
+                "solver_diag": best_solver_diag,
+                "solver_attempts": bucket_solver_attempts,
+                "band_lo": bucket_lo,
+                "band_hi": _to_json_float(bucket_hi_v),
+                "achieved_risk_pct": _to_json_float(final_risk),
+                "feasible_in_band": within_bucket_flag,
+                "fallback_used": True,
+                "fallback_reason": "simple_round_fallback_from_postprocess_zero",
+                "fallback_level": 4,
+                "quantize_method": "simple_round_fallback",
+                "fixed_holdings_count": len(final_rows_out),
+                "class_soft_swaps": 0,
+                "repair_steps": None,
+                "final_hash": final_hash,
+                "duplicate_warning": dup_warning,
+              },
+            }
+            used_fallback_level = 4
+
     if success_payload is None:
       constraints_meta_error = dict(constraints_meta)
       constraints_meta_error.update({
@@ -2454,7 +2599,7 @@ def build_portfolio_qp(
           "feasible_min_risk_est": feasible_min_risk_est,
           "reason_category": "postprocess" if str(last_attempt_error).startswith("postprocess") else "solver_failure",
           "fallback_level": 3,
-          "lo": bucket["min"],
+          "lo": bucket_lo,
           "hi": bucket["max"],
           "constraints": constraints_meta_error,
         },
