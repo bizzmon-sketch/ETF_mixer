@@ -2354,6 +2354,9 @@ def build_portfolio_qp(
         final_weights,
         periods_per_year=int(scaling_policy["periods_per_year"]),
       )
+      weights_for_52w = {h["Code"]: float(w) * 100.0 for h, w in zip(final_rows_out, final_weights)}
+      return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w)
+      risk_pct_rounded = round(risk_pct, 2) if risk_pct is not None else None
       adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
 
       final_hash = _compute_final_hash(
@@ -2382,9 +2385,10 @@ def build_portfolio_qp(
         "holdings_display_truncated": bool(display_truncated),
       })
       success_payload = {
-        "risk_pct": final_risk,
-        "return_6m": total_return,
-        "sharpe_120d": final_sharpe,
+        "risk_pct": risk_pct_rounded,
+        "return_52w": return_52w,
+        "return_6m": return_52w,
+        "sharpe_120d": sharpe_52w,
         "sharpe_window": final_sharpe,
         "holdings": holdings_output,
         "meta": {
@@ -2497,6 +2501,9 @@ def build_portfolio_qp(
               final_weights,
               periods_per_year=int(scaling_policy["periods_per_year"]),
             )
+            weights_for_52w = {h["Code"]: float(w) * 100.0 for h, w in zip(final_rows_out, final_weights)}
+            return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w)
+            risk_pct_rounded = round(risk_pct, 2) if risk_pct is not None else None
             adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
             final_hash = _compute_final_hash(
               final_weights,
@@ -2525,9 +2532,10 @@ def build_portfolio_qp(
             })
 
             success_payload = {
-              "risk_pct": final_risk,
-              "return_6m": total_return,
-              "sharpe_120d": final_sharpe,
+              "risk_pct": risk_pct_rounded,
+              "return_52w": return_52w,
+              "return_6m": return_52w,
+              "sharpe_120d": sharpe_52w,
               "sharpe_window": final_sharpe,
               "holdings": holdings_output,
               "meta": {
@@ -2969,19 +2977,21 @@ def _generate_portfolios_sampled(
         continue
       total_return, total_risk, output_holdings = _compute_portfolio_metrics(holdings, weights)
       return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(holdings, weights)
+      risk_pct_rounded = round(risk_pct, 2) if risk_pct is not None else None
       candidates.append({
         "risk_bucket": bucket["label"],
-        "risk_pct": risk_pct if risk_pct is not None else total_risk,
-        "return_6m": total_return,
+        "risk_pct": risk_pct_rounded,
+        "return_6m": return_52w,
         "return_52w": return_52w,
         "sharpe_52w": sharpe_52w,
+        "sharpe_120d": sharpe_52w,
         "score_mode": score_mode,
         "holdings": output_holdings,
         "meta": {
           "target_risk": target_risk,
           "within_bucket": within_bucket,
-          "chosen_risk": risk_pct if risk_pct is not None else total_risk,
-          "distance_to_target": abs((risk_pct if risk_pct is not None else total_risk) - target_risk) if (risk_pct is not None or total_risk is not None) else None,
+          "chosen_risk": risk_pct_rounded,
+          "distance_to_target": abs(risk_pct_rounded - target_risk) if risk_pct_rounded is not None else None,
           "tune_iters": tune_iters,
           "moves": moves,
           "lo": bucket["min"],
