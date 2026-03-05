@@ -575,7 +575,7 @@
         const bh = state.customEval.bh || {};
         const rb = state.customEval.rb || {};
         resultEl.innerHTML = `
-          <div class="small-muted">BH 수익률 ${fmtPctFromRatioSafe(bh.return_26w, 1)} · 샤프 ${bh.sharpe ?? '-'} | RB 수익률 ${fmtPctFromRatioSafe(rb.return_26w, 1)} · 샤프 ${rb.sharpe ?? '-'}</div>
+          <div class="small-muted">BH 수익률(26주) ${fmtPctFromRatioSafe(bh.return_26w, 1)} · (52주) ${fmtPctFromRatioSafe(bh.return_52w, 1)} · 샤프 ${bh.sharpe ?? '-'} | RB 수익률(26주) ${fmtPctFromRatioSafe(rb.return_26w, 1)} · (52주) ${fmtPctFromRatioSafe(rb.return_52w, 1)} · 샤프 ${rb.sharpe ?? '-'}</div>
         `;
       } else {
         resultEl.innerHTML = '';
@@ -1251,11 +1251,7 @@
           (scatter.meta && scatter.meta.is_current_week_partial) ? '' : 'none';
       }
       const filterBuckets = (items) => (Array.isArray(items) ? items : [])
-        .filter((item) => {
-          const bucket = String(item.risk_bucket || '');
-          if (bucket.startsWith('12')) return false;
-          return Number(item.risk_pct) < 12;
-        });
+        .filter((item) => item && typeof item === 'object');
       state.portfoliosBase = filterBuckets(portfolios.base || portfolios.items);
       state.portfoliosDelta = filterBuckets(portfolios.delta || []);
       state.portfolioMode = 'base';
