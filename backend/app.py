@@ -283,8 +283,9 @@ def _is_multiple_of_5(value: float) -> bool:
 
 def _load_weekly_prices(codes: list[str], weeks: int) -> object:
   end = engine.pd.Timestamp.today().normalize()
-  # 26주 + 리샘플 여유분 확보를 위해 9개월 범위를 조회한다.
-  start = end - engine.pd.DateOffset(months=9)
+  # 조회 주차(weeks) + 리샘플 여유분을 고려해 충분한 기간을 확보한다.
+  months = max(9, int(((max(weeks, 1) + 1) * 12 + 51) // 52) + 2)
+  start = end - engine.pd.DateOffset(months=months)
   daily = engine.load_close_prices(codes, start, end)
   if daily is None or daily.empty:
     return engine.pd.DataFrame()
@@ -352,7 +353,7 @@ def custom_portfolio_eval():
       "total": round(total_weight, 6),
     }), 400
 
-  weekly_prices = _load_weekly_prices(codes, 26)
+  weekly_prices = _load_weekly_prices(codes, 52)
   if weekly_prices.empty:
     return jsonify({"error": "code_not_found", "message": "DB에 없는 종목 코드가 포함되어 있습니다"}), 400
   missing_codes = [code for code in codes if code not in weekly_prices.columns]
@@ -364,27 +365,30 @@ def custom_portfolio_eval():
     }), 400
 
   aligned = weekly_prices[codes].dropna(how="any")
-  if len(aligned) < 27:
+  if len(aligned) < 53:
     return jsonify({
       "error": "insufficient_data",
-      "message": "26주 계산에 필요한 주봉 데이터가 부족합니다",
+      "message": "52주 계산에 필요한 주봉 데이터가 부족합니다",
     }), 400
+  prices_52w = aligned.tail(53)
   prices_26w = aligned.tail(27)
-  returns_26w = engine.np.log(prices_26w / prices_26w.shift(1)).dropna(how="any")
+  returns_52w = engine.np.log(prices_52w / prices_52w.shift(1)).dropna(how="any")
 
-  bh_return, bh_risk, bh_sharpe, bh_prices = engine.compute_custom_portfolio_bh(codes, weights, returns_26w)
-  rb_return, rb_risk, rb_sharpe, rb_prices = engine.compute_custom_portfolio_rb(codes, weights, prices_26w)
+  bh_return, bh_risk, bh_sharpe, bh_prices = engine.compute_custom_portfolio_bh(codes, weights, returns_52w)
+  rb_return, rb_risk, rb_sharpe, rb_prices = engine.compute_custom_portfolio_rb(codes, weights, prices_52w)
+  if len(rb_prices) > 27:
+    rb_prices = rb_prices[-27:]
 
   response = {
     "holdings": cleaned_holdings,
     "bh": {
-      "return_26w": bh_return,
+      "return_52w": bh_return,
       "risk_pct": bh_risk,
       "sharpe": bh_sharpe,
       "prices": bh_prices,
     },
     "rb": {
-      "return_26w": rb_return,
+      "return_52w": rb_return,
       "risk_pct": rb_risk,
       "sharpe": rb_sharpe,
       "prices": rb_prices,

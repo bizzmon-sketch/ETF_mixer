@@ -2742,33 +2742,35 @@ def _compute_portfolio_metrics(
   return total_return, total_risk, output_holdings
 
 
-def _compute_portfolio_120d_metrics(
+def _compute_portfolio_52w_metrics(
   holdings: List[Dict[str, object]],
   weights: Dict[str, int],
-  returns_tail: pd.DataFrame | None,
-) -> Tuple[float | None, float | None]:
-  if returns_tail is None or returns_tail.empty:
-    return None, None
+) -> Tuple[float | None, float | None, float | None]:
+  weekly_returns = _CACHE.get("returns_tail")
+  if not isinstance(weekly_returns, pd.DataFrame) or weekly_returns.empty:
+    return None, None, None
   codes = [
     h["Code"] for h in holdings
-    if weights.get(h["Code"], 0) > 0 and h["Code"] in returns_tail.columns
+    if weights.get(h["Code"], 0) > 0 and h["Code"] in weekly_returns.columns
   ]
   if not codes:
-    return None, None
-  returns_slice = returns_tail[codes].dropna(how="any")
+    return None, None, None
+  returns_slice = weekly_returns[codes].dropna(how="any")
   if returns_slice.empty:
-    return None, None
-  weight_values = np.array([weights[code] / 100 for code in codes], dtype=float)
-  rp = returns_slice.mul(weight_values, axis=1).sum(axis=1)
-  if rp.empty:
-    return None, None
-  return_120d = (1 + rp).prod() - 1
-  std = rp.std()
+    return None, None, None
+  weight_arr = np.array([weights[code] / 100 for code in codes], dtype=float)
+  port_log = returns_slice[codes] @ weight_arr
+  if port_log.empty:
+    return None, None, None
+  return_52w = float(np.exp(port_log.sum()) - 1.0)
+  std = float(port_log.std(ddof=1))
   if std is None or np.isnan(std) or std == 0:
-    sharpe_120d = None
+    sharpe_52w = None
+    risk_pct = None
   else:
-    sharpe_120d = (rp.mean() / std) * np.sqrt(252)
-  return float(return_120d), None if sharpe_120d is None else float(sharpe_120d)
+    sharpe_52w = float((port_log.mean() / std) * np.sqrt(52.0))
+    risk_pct = float(std * np.sqrt(52.0) * 100.0)
+  return float(return_52w), None if sharpe_52w is None else float(sharpe_52w), risk_pct
 
 
 def _tune_weights_to_target(
@@ -2966,20 +2968,20 @@ def _generate_portfolios_sampled(
       if total_weight != 100:
         continue
       total_return, total_risk, output_holdings = _compute_portfolio_metrics(holdings, weights)
-      return_120d, sharpe_120d = _compute_portfolio_120d_metrics(holdings, weights, returns_tail)
+      return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(holdings, weights)
       candidates.append({
         "risk_bucket": bucket["label"],
-        "risk_pct": total_risk,
+        "risk_pct": risk_pct if risk_pct is not None else total_risk,
         "return_6m": total_return,
-        "return_120d": return_120d,
-        "sharpe_120d": sharpe_120d,
+        "return_52w": return_52w,
+        "sharpe_52w": sharpe_52w,
         "score_mode": score_mode,
         "holdings": output_holdings,
         "meta": {
           "target_risk": target_risk,
           "within_bucket": within_bucket,
-          "chosen_risk": total_risk,
-          "distance_to_target": abs(total_risk - target_risk) if total_risk is not None else None,
+          "chosen_risk": risk_pct if risk_pct is not None else total_risk,
+          "distance_to_target": abs((risk_pct if risk_pct is not None else total_risk) - target_risk) if (risk_pct is not None or total_risk is not None) else None,
           "tune_iters": tune_iters,
           "moves": moves,
           "lo": bucket["min"],
@@ -3001,16 +3003,16 @@ def _generate_portfolios_sampled(
     if in_bucket:
       if score_mode == "return":
         def score_value(candidate: Dict[str, object]) -> float:
-          return float(candidate.get("return_120d") or candidate.get("return_6m") or float("-inf"))
+          return float(candidate.get("return_52w") or candidate.get("return_6m") or float("-inf"))
       else:
         def score_value(candidate: Dict[str, object]) -> float:
-          value = candidate.get("sharpe_120d")
+          value = candidate.get("sharpe_52w")
           if value is None or (isinstance(value, float) and np.isnan(value)):
             return float("-inf")
           return float(value)
       best = max(
         in_bucket,
-        key=lambda c: (score_value(c), c.get("return_120d") or c.get("return_6m") or 0.0, -c["risk_pct"]),
+        key=lambda c: (score_value(c), c.get("return_52w") or c.get("return_6m") or 0.0, -c["risk_pct"]),
       )
       items.append(best)
       continue
@@ -3057,8 +3059,8 @@ def _generate_portfolios_grid(
       "risk_bucket": bucket["label"],
       "risk_pct": None,
       "return_6m": None,
-      "return_120d": None,
-      "sharpe_120d": None,
+      "return_52w": None,
+      "sharpe_52w": None,
       "score_mode": "return",
       "holdings": [],
       "error": "strategy_not_implemented",
@@ -3079,8 +3081,8 @@ def _generate_portfolios_bucket_fallback(
       "risk_bucket": bucket["label"],
       "risk_pct": None,
       "return_6m": None,
-      "return_120d": None,
-      "sharpe_120d": None,
+      "return_52w": None,
+      "sharpe_52w": None,
       "score_mode": "return",
       "holdings": [],
       "error": "strategy_not_implemented",
@@ -3122,8 +3124,8 @@ def generate_portfolios(
         "risk_bucket": bucket["label"],
         "risk_pct": None,
         "return_6m": None,
-        "return_120d": None,
-        "sharpe_120d": None,
+        "return_52w": None,
+        "sharpe_52w": None,
         "score_mode": score_mode,
         "holdings": [],
         "error": "no_data",
@@ -3132,7 +3134,9 @@ def generate_portfolios(
       "risk_unit": "monthly_vol_pct",
       "risk_pct_unit": "monthly_vol_pct",
       "return_6m_unit": "cumulative",
+      "return_52w_unit": "cumulative",
       "return_120d_unit": "cumulative",
+      "sharpe_52w_unit": "annualized",
       "sharpe_120d_unit": "annualized",
       "return_calc_basis": "weekly_log_internal_return52w_simple_output",
       "freq": scaling_policy["freq"],
@@ -3194,7 +3198,9 @@ def generate_portfolios(
     "risk_unit": "monthly_vol_pct",
     "risk_pct_unit": "monthly_vol_pct",
     "return_6m_unit": "cumulative",
+    "return_52w_unit": "cumulative",
     "return_120d_unit": "cumulative",
+    "sharpe_52w_unit": "annualized",
     "sharpe_120d_unit": "annualized",
     "return_calc_basis": "weekly_log_internal_return52w_simple_output",
     "freq": scaling_policy["freq"],
@@ -3345,14 +3351,14 @@ def get_price_series(code: str, days: int = 120) -> Dict[str, object]:
 def compute_custom_portfolio_bh(
   codes: List[str],
   weights: List[float],
-  returns_weekly_26w: pd.DataFrame,
+  returns_weekly_52w: pd.DataFrame,
 ) -> Tuple[float, float, float | None, List[Dict[str, object]]]:
-  if returns_weekly_26w is None or returns_weekly_26w.empty:
+  if returns_weekly_52w is None or returns_weekly_52w.empty:
     return 0.0, 0.0, None, []
   if not codes or not weights or len(codes) != len(weights):
     return 0.0, 0.0, None, []
 
-  missing = [code for code in codes if code not in returns_weekly_26w.columns]
+  missing = [code for code in codes if code not in returns_weekly_52w.columns]
   if missing:
     return 0.0, 0.0, None, []
 
@@ -3362,7 +3368,7 @@ def compute_custom_portfolio_bh(
     return 0.0, 0.0, None, []
   weights_arr = weights_arr / total
 
-  selected = returns_weekly_26w[codes].dropna(how="any")
+  selected = returns_weekly_52w[codes].dropna(how="any")
   if selected.empty:
     return 0.0, 0.0, None, []
 
@@ -3375,6 +3381,8 @@ def compute_custom_portfolio_bh(
     normalized = cumulative
   else:
     normalized = cumulative / float(cumulative.iloc[0])
+  if len(normalized) > 26:
+    normalized = normalized.tail(26)
 
   prices = []
   for idx, value in normalized.items():
@@ -3383,17 +3391,17 @@ def compute_custom_portfolio_bh(
       "value": round(float(value), 6),
     })
 
-  return_26w = float(np.exp(float(portfolio_log.sum())) - 1.0)
+  return_52w = float(np.exp(float(portfolio_log.sum())) - 1.0)
   if len(portfolio_log) < 2:
-    return round(return_26w, 6), 0.0, None, prices
+    return round(return_52w, 6), 0.0, None, prices
 
   std = float(portfolio_log.std(ddof=1))
   if std < 1e-12:
-    return round(return_26w, 6), 0.0, None, prices
+    return round(return_52w, 6), 0.0, None, prices
 
   risk_pct = float(std * _WEEKLY_SCALE_TO_MONTHLY * 100.0)
-  sharpe = float((float(portfolio_log.mean()) - _RF_WEEKLY) / std * np.sqrt(_WEEKLY_PERIODS_PER_YEAR))
-  return round(return_26w, 6), round(risk_pct, 4), round(sharpe, 4), prices
+  sharpe_52w = float((float(portfolio_log.mean()) - _RF_WEEKLY) / std * np.sqrt(_WEEKLY_PERIODS_PER_YEAR))
+  return round(return_52w, 6), round(risk_pct, 4), round(sharpe_52w, 4), prices
 
 
 def compute_custom_portfolio_rb(
