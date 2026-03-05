@@ -169,6 +169,7 @@
             <span class="tag tag-demo">DEMO</span>
           </div>
           <div class="card-body">
+            <div class="bucket-tabs mb-2" id="modeTabs"></div>
             <div class="bucket-tabs" id="bucketTabs"></div>
           </div>
         </div>
@@ -210,6 +211,23 @@
             <span class="tag tag-demo">DEMO</span>
           </div>
           <div class="card-body" id="sidebar">
+            <div id="customBuilder" class="d-none mb-3">
+              <div class="d-flex align-items-center justify-content-between">
+                <div class="fw-bold">Custom 포트 구성</div>
+                <span class="small-muted" id="customMsg"></span>
+              </div>
+              <div class="small-muted mb-2">산점도에서 ETF를 클릭해 추가하세요. (최대 5종목)</div>
+              <div id="customHoldingsList"></div>
+              <div class="d-flex align-items-center justify-content-between mt-2">
+                <div class="fw-bold" id="customWeightSum">합계 0%</div>
+                <div class="d-flex gap-2">
+                  <button class="btn btn-sm btn-outline-secondary" id="btnCustomReset" type="button">초기화</button>
+                  <button class="btn btn-sm btn-soft" id="btnCustomCalc" type="button" disabled>계산</button>
+                </div>
+              </div>
+              <div class="small mt-2" id="customResult"></div>
+              <hr class="my-3" />
+            </div>
             <div class="text-center py-4" id="sidebarEmpty">
               <div class="fw-bold mb-2">차트에서 점을 클릭해보세요</div>
               <div class="small-muted">선택한 포트폴리오의 종목 비중/지표 정보를 표시합니다.</div>
@@ -259,7 +277,7 @@
               </div>
 
               <div class="price-panel">
-                <div class="fw-bold">최근 종가 추이</div>
+                <div class="fw-bold">최근 26주 추이</div>
                 <div class="small-muted" id="priceStatus">ETF를 선택하면 가격 추이가 표시됩니다.</div>
                 <div id="priceChart"></div>
               </div>
@@ -268,88 +286,6 @@
         </div>
       </div>
 
-      <div class="col-12 col-lg-4 order-4 order-lg-2">
-        <div class="card mb-3">
-          <div class="card-header d-flex align-items-center justify-content-between">
-            <div class="fw-bold">포트 저장</div>
-            <span class="tag tag-demo">DEMO</span>
-          </div>
-          <div class="card-body">
-            <div class="mb-2">
-              <label class="form-label small-muted" for="savePortfolioName">포트 이름</label>
-              <input class="form-control form-control-sm" type="text" id="savePortfolioName" placeholder="예: 연금-안정형" />
-            </div>
-            <div class="mb-2">
-              <label class="form-label small-muted" for="savePortfolioBudget">초기 투자금 (원)</label>
-              <input class="form-control form-control-sm" type="number" id="savePortfolioBudget" placeholder="예: 10000000" />
-            </div>
-            <div class="d-flex align-items-center gap-2">
-              <button class="btn btn-soft btn-sm" id="btnSavePortfolio" type="button">현재 포트 저장</button>
-              <div class="small-muted" id="savePortfolioMsg">추천 포트를 선택한 뒤 저장하세요.</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card mb-3">
-          <div class="card-header d-flex align-items-center justify-content-between">
-            <div class="fw-bold">저장된 포트 관리</div>
-            <span class="tag tag-demo">DEMO</span>
-          </div>
-          <div class="card-body">
-            <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
-              <select class="form-select form-select-sm" id="savedPortfolioSelect" style="max-width: 240px;"></select>
-              <button class="btn btn-sm btn-outline-secondary" id="btnLoadSavedPortfolios" type="button">새로고침</button>
-              <button class="btn btn-sm btn-soft" id="btnOpenSavedPortfolio" type="button">불러오기</button>
-            </div>
-            <div class="small-muted mb-2" id="savedPortfolioMsg">저장된 포트를 선택하세요.</div>
-            <div id="savedPortfolioSummary" class="small"></div>
-
-            <hr class="my-3" />
-
-            <div class="fw-bold mb-2">체결 입력</div>
-            <div class="row g-2 align-items-end">
-              <div class="col-4">
-                <label class="form-label small-muted" for="tradeCode">코드</label>
-                <input class="form-control form-control-sm" type="text" id="tradeCode" placeholder="예: 394670" />
-              </div>
-              <div class="col-4">
-                <label class="form-label small-muted" for="tradeSide">구분</label>
-                <select class="form-select form-select-sm" id="tradeSide">
-                  <option value="BUY">BUY</option>
-                  <option value="SELL">SELL</option>
-                  <option value="CASH_IN">CASH_IN</option>
-                </select>
-              </div>
-              <div class="col-4">
-                <label class="form-label small-muted" for="tradeQty">수량/금액</label>
-                <input class="form-control form-control-sm" type="number" id="tradeQty" placeholder="수량 또는 금액" />
-              </div>
-              <div class="col-4">
-                <label class="form-label small-muted" for="tradePrice">체결가(옵션)</label>
-                <input class="form-control form-control-sm" type="number" id="tradePrice" placeholder="예: 10500" />
-              </div>
-              <div class="col-8">
-                <button class="btn btn-sm btn-soft" id="btnAddTrade" type="button">체결 입력</button>
-                <span class="small-muted ms-2" id="tradeMsg"></span>
-              </div>
-            </div>
-
-            <hr class="my-3" />
-
-            <div class="fw-bold mb-2">리밸런스</div>
-            <div class="d-flex flex-wrap gap-2 align-items-end mb-2">
-              <div>
-                <label class="form-label small-muted" for="rebalanceBand">밴드(%)</label>
-                <input class="form-control form-control-sm" type="number" id="rebalanceBand" value="5" style="width: 90px;" />
-              </div>
-              <button class="btn btn-sm btn-outline-secondary" id="btnRebalancePlan" type="button">플랜 보기</button>
-              <button class="btn btn-sm btn-soft" id="btnRebalanceCommit" type="button">커밋</button>
-              <span class="small-muted" id="rebalanceMsg"></span>
-            </div>
-            <div id="rebalancePlan" class="small"></div>
-          </div>
-        </div>
-      </div>
     </div>
 
   </div>
@@ -391,11 +327,8 @@
         scatter: '/api/scatter',
         portfolios: '/api/portfolios?strategy=qp',
         prices: '/api/prices',
-        savedPortfolios: '/api/portfolios/saved',
-        savedPortfolioDetail: (id) => `/api/portfolios/saved/${id}`,
-        savedPortfolioTrade: (id) => `/api/portfolios/saved/${id}/trade`,
-        savedPortfolioRebalancePlan: (id) => `/api/portfolios/saved/${id}/rebalance/plan`,
-        savedPortfolioRebalanceCommit: (id) => `/api/portfolios/saved/${id}/rebalance/commit`,
+        benchmarkPrices: '/api/benchmark_prices',
+        customPortfolioEval: '/api/custom_portfolio_eval',
       },
       colors: {
         points: 'rgba(108,117,125,0.45)',
@@ -420,11 +353,14 @@
     const state = {
       scatterItems: [],
       portfolios: [],
+      portfoliosBase: [],
+      portfoliosDelta: [],
+      portfolioMode: 'base',
       selectedCode: null,
       selectedPortfolioBucket: null,
-      savedPortfolios: [],
-      savedDetail: null,
-      savedRebalancePlan: null,
+      customSelection: [],
+      customEval: null,
+      benchmarkPayload: null,
       hoverPoint: null,
       hoverMeta: null,
       zoom: null,
@@ -522,6 +458,153 @@
       });
 
       updateBucketTabActive();
+    }
+
+    function renderModeTabs() {
+      const container = document.getElementById('modeTabs');
+      if (!container) return;
+      container.innerHTML = '';
+      [
+        { mode: 'base', label: 'base' },
+        { mode: 'delta', label: 'delta' },
+      ].forEach((item) => {
+        const btn = document.createElement('button');
+        btn.className = `bucket-btn${state.portfolioMode === item.mode ? ' active' : ''}`;
+        btn.type = 'button';
+        btn.textContent = item.label;
+        btn.setAttribute('data-mode', item.mode);
+        btn.addEventListener('click', () => setPortfolioMode(item.mode));
+        container.appendChild(btn);
+      });
+    }
+
+    function setPortfolioMode(mode) {
+      const nextMode = mode === 'delta' ? 'delta' : 'base';
+      state.portfolioMode = nextMode;
+      state.portfolios = nextMode === 'delta' ? state.portfoliosDelta : state.portfoliosBase;
+      if (!state.portfolios.some((item) => item.risk_bucket === state.selectedPortfolioBucket)) {
+        state.selectedPortfolioBucket = null;
+      }
+      renderModeTabs();
+      renderRecommendCards();
+      renderPlot();
+      if (state.selectedPortfolioBucket) {
+        const selected = state.portfolios.find((item) => item.risk_bucket === state.selectedPortfolioBucket);
+        renderSidebar(selected || null);
+      }
+    }
+
+    function getCustomWeightSum() {
+      return state.customSelection.reduce((acc, item) => acc + Number(item.weight || 0), 0);
+    }
+
+    function showCustomMessage(text) {
+      const msgEl = document.getElementById('customMsg');
+      if (msgEl) msgEl.textContent = text || '';
+    }
+
+    function clearCustomEvaluation() {
+      state.customEval = null;
+      renderPlot();
+    }
+
+    function addCustomHolding(item) {
+      const exists = state.customSelection.some((h) => h.Code === item.Code);
+      if (exists) {
+        showCustomMessage('이미 추가된 종목입니다.');
+        renderCustomBuilder();
+        return;
+      }
+      if (state.customSelection.length >= 5) {
+        showCustomMessage('최대 5종목');
+        renderCustomBuilder();
+        return;
+      }
+      state.customSelection.push({
+        Code: item.Code,
+        Name: item.Name,
+        weight: 20,
+      });
+      showCustomMessage('');
+      clearCustomEvaluation();
+      renderCustomBuilder();
+    }
+
+    function renderCustomBuilder() {
+      const root = document.getElementById('customBuilder');
+      const listEl = document.getElementById('customHoldingsList');
+      const sumEl = document.getElementById('customWeightSum');
+      const calcBtn = document.getElementById('btnCustomCalc');
+      const resultEl = document.getElementById('customResult');
+      if (!root || !listEl || !sumEl || !calcBtn || !resultEl) return;
+
+      if (state.customSelection.length === 0) {
+        root.classList.add('d-none');
+        resultEl.innerHTML = '';
+        return;
+      }
+
+      root.classList.remove('d-none');
+      listEl.innerHTML = '';
+      state.customSelection.forEach((holding, idx) => {
+        const row = document.createElement('div');
+        row.className = 'mb-2';
+        row.innerHTML = `
+          <div class="d-flex align-items-center justify-content-between gap-2">
+            <div class="fw-bold" style="font-size: 14px;">${escapeHtml(holding.Name)} <span class="text-muted mono">(${escapeHtml(holding.Code)})</span></div>
+            <div class="d-flex align-items-center gap-2">
+              <span class="mono fw-bold" id="customWeightValue-${idx}">${Number(holding.weight).toFixed(0)}%</span>
+              <button class="btn btn-sm btn-outline-secondary" type="button" data-custom-remove="${idx}">삭제</button>
+            </div>
+          </div>
+          <input type="range" class="form-range mt-1" min="5" max="60" step="5" value="${Number(holding.weight)}" data-custom-weight="${idx}">
+        `;
+        listEl.appendChild(row);
+      });
+
+      const total = getCustomWeightSum();
+      sumEl.textContent = `합계 ${total.toFixed(0)}%`;
+      if (Math.round(total) !== 100) {
+        sumEl.classList.add('text-danger');
+      } else {
+        sumEl.classList.remove('text-danger');
+      }
+      calcBtn.disabled = !(Math.round(total) === 100 && state.customSelection.length >= 2);
+
+      if (state.customEval) {
+        const bh = state.customEval.bh || {};
+        const rb = state.customEval.rb || {};
+        resultEl.innerHTML = `
+          <div class="small-muted">BH 수익률 ${fmtPctFromRatioSafe(bh.return_26w, 1)} · 샤프 ${bh.sharpe ?? '-'} | RB 수익률 ${fmtPctFromRatioSafe(rb.return_26w, 1)} · 샤프 ${rb.sharpe ?? '-'}</div>
+        `;
+      } else {
+        resultEl.innerHTML = '';
+      }
+
+      listEl.querySelectorAll('[data-custom-weight]').forEach((input) => {
+        input.addEventListener('input', (ev) => {
+          const target = ev.target;
+          const idx = Number(target.getAttribute('data-custom-weight'));
+          const value = Number(target.value || 0);
+          if (Number.isNaN(idx) || !state.customSelection[idx]) return;
+          state.customSelection[idx].weight = value;
+          const label = document.getElementById(`customWeightValue-${idx}`);
+          if (label) label.textContent = `${value.toFixed(0)}%`;
+          clearCustomEvaluation();
+          renderCustomBuilder();
+        });
+      });
+
+      listEl.querySelectorAll('[data-custom-remove]').forEach((btn) => {
+        btn.addEventListener('click', (ev) => {
+          const target = ev.target;
+          const idx = Number(target.getAttribute('data-custom-remove'));
+          if (Number.isNaN(idx)) return;
+          state.customSelection = state.customSelection.filter((_, i) => i !== idx);
+          clearCustomEvaluation();
+          renderCustomBuilder();
+        });
+      });
     }
 
     function renderSidebar(item) {
@@ -736,6 +819,30 @@
         z: 3,
       });
 
+      const customScatter = state.customEval && state.customEval.scatter_point
+        ? state.customEval.scatter_point
+        : null;
+      if (customScatter && customScatter.bh && customScatter.rb) {
+        series.push({
+          id: 'customBHMarker',
+          name: 'Custom BH',
+          type: 'scatter',
+          data: [{ value: [customScatter.bh.x, customScatter.bh.y] }],
+          symbolSize: 14,
+          itemStyle: { color: '#6c757d', borderColor: '#495057', borderWidth: 1.5 },
+          z: 6,
+        });
+        series.push({
+          id: 'customRBMarker',
+          name: 'Custom RB',
+          type: 'scatter',
+          data: [{ value: [customScatter.rb.x, customScatter.rb.y] }],
+          symbolSize: 14,
+          itemStyle: { color: '#0d6efd', borderColor: '#0b5ed7', borderWidth: 1.5 },
+          z: 6,
+        });
+      }
+
       return series;
     }
 
@@ -890,7 +997,7 @@
             return;
           }
           if (meta.type === 'etf') {
-            selectEtfByCode(meta.code);
+            selectEtfByCode(meta.code, { addToCustom: true });
           }
         });
 
@@ -1006,292 +1113,128 @@
       return res.json();
     }
 
-    function renderSavedPortfolioSummary(detail) {
-      const summaryEl = document.getElementById('savedPortfolioSummary');
-      if (!summaryEl) return;
-      if (!detail || !detail.portfolio) {
-        summaryEl.innerHTML = '';
-        return;
-      }
-
-      const portfolio = detail.portfolio || {};
-      const targets = Array.isArray(detail.targets) ? detail.targets : [];
-      const holdings = Array.isArray(detail.holdings) ? detail.holdings : [];
-      const trades = Array.isArray(detail.trades) ? detail.trades : [];
-
-      const holdingsLines = holdings.map((item) => {
-        const weight = item.weight_pct === null || item.weight_pct === undefined
-          ? '-'
-          : `${Number(item.weight_pct).toFixed(1)}%`;
-        const price = item.price === null || item.price === undefined ? '-' : Number(item.price).toFixed(2);
-        const value = item.value === null || item.value === undefined ? '-' : Number(item.value).toFixed(0);
-        return `<div class="d-flex justify-content-between">
-          <div>${escapeHtml(item.code || '-')} ${escapeHtml(item.name || '')}</div>
-          <div class="mono">${weight} · ${price} · ${value}</div>
-        </div>`;
-      }).join('');
-
-      const targetLines = targets.map((item) => {
-        return `<div class="d-flex justify-content-between">
-          <div>${escapeHtml(item.code)} ${escapeHtml(item.name)} <span class="small-muted">${escapeHtml(item.asset_class || '-')}</span></div>
-          <div class="mono">${Number(item.target_weight_pct).toFixed(1)}%</div>
-        </div>`;
-      }).join('');
-
-      const tradeRows = trades.slice(-10).reverse().map((item) => {
-        const price = item.price === null || item.price === undefined ? '-' : Number(item.price).toFixed(2);
-        return `<tr>
-          <td class="mono">${escapeHtml(item.ts || '-')}</td>
-          <td>${escapeHtml(item.side || '-')}</td>
-          <td class="mono">${escapeHtml(item.code || '-')}</td>
-          <td class="text-end mono">${escapeHtml(String(item.qty || '-'))}</td>
-          <td class="text-end mono">${price}</td>
-        </tr>`;
-      }).join('');
-
-      const cashLine = detail.cash !== undefined && detail.cash !== null
-        ? `<div class="small-muted">현금: <span class="mono">${Number(detail.cash).toFixed(0)}</span></div>`
-        : '';
-      const totalLine = detail.total_value !== undefined && detail.total_value !== null
-        ? `<div class="small-muted">총 평가: <span class="mono">${Number(detail.total_value).toFixed(0)}</span></div>`
-        : '';
-
-      summaryEl.innerHTML = `
-        <div class="fw-bold">${escapeHtml(portfolio.name || '-')}</div>
-        <div class="small-muted">초기 예산: <span class="mono">${Number(portfolio.initial_budget_krw || 0).toFixed(0)}</span></div>
-        ${cashLine}
-        ${totalLine}
-        <div class="mt-2">
-          <div class="fw-bold">타겟 비중</div>
-          ${targetLines || '<div class="small-muted">-</div>'}
-        </div>
-        ${holdings.length ? `
-          <div class="mt-2">
-            <div class="fw-bold">현재 보유</div>
-            ${holdingsLines}
-          </div>
-        ` : ''}
-        ${trades.length ? `
-          <div class="mt-2">
-            <div class="fw-bold">최근 체결(10)</div>
-            <div class="table-responsive">
-              <table class="table table-sm align-middle">
-                <thead>
-                  <tr>
-                    <th>시간</th>
-                    <th>구분</th>
-                    <th>코드</th>
-                    <th class="text-end">수량</th>
-                    <th class="text-end">체결가</th>
-                  </tr>
-                </thead>
-                <tbody>${tradeRows}</tbody>
-              </table>
-            </div>
-          </div>
-        ` : ''}
-      `;
+    function toDateSeries(items) {
+      return (Array.isArray(items) ? items : [])
+        .map((row) => ({ date: row.date, value: Number(row.value) }))
+        .filter((row) => row.date && Number.isFinite(row.value));
     }
 
-    function renderRebalancePlan(plan) {
-      const el = document.getElementById('rebalancePlan');
-      if (!el) return;
-      if (!plan || !Array.isArray(plan.orders) || plan.orders.length === 0) {
-        el.innerHTML = '<div class="small-muted">리밸런스 주문이 없습니다.</div>';
-        return;
-      }
-      const rows = plan.orders.map((item) => {
-        const price = item.price === null || item.price === undefined ? '-' : Number(item.price).toFixed(2);
-        const amount = item.delta_value === null || item.delta_value === undefined
-          ? '-'
-          : Number(item.delta_value).toFixed(0);
-        return `<tr>
-          <td class="mono">${escapeHtml(item.code || '-')}</td>
-          <td>${escapeHtml(item.side || '-')}</td>
-          <td class="text-end mono">${escapeHtml(String(item.qty || '-'))}</td>
-          <td class="text-end mono">${price}</td>
-          <td class="text-end mono">${amount}</td>
-        </tr>`;
-      }).join('');
-      el.innerHTML = `
-        <div class="table-responsive">
-          <table class="table table-sm align-middle">
-            <thead>
-              <tr>
-                <th>코드</th>
-                <th>구분</th>
-                <th class="text-end">수량</th>
-                <th class="text-end">가격</th>
-                <th class="text-end">금액(추정)</th>
-              </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-          </table>
-        </div>
-      `;
+    function alignSeriesByDate(seriesDefs) {
+      const dateSet = new Set();
+      seriesDefs.forEach((def) => {
+        (def.points || []).forEach((p) => dateSet.add(p.date));
+      });
+      const dates = Array.from(dateSet).sort();
+      const aligned = seriesDefs.map((def) => {
+        const map = new Map((def.points || []).map((p) => [p.date, p.value]));
+        return {
+          name: def.name,
+          color: def.color,
+          width: def.width,
+          data: dates.map((d) => (map.has(d) ? map.get(d) : null)),
+        };
+      });
+      return { dates, series: aligned };
     }
 
-    async function loadSavedPortfolios() {
-      const select = document.getElementById('savedPortfolioSelect');
-      const msg = document.getElementById('savedPortfolioMsg');
-      if (!select || !msg) return;
-      msg.textContent = '불러오는 중...';
+    async function getBenchmarkSeries(weeks = 26) {
+      if (!state.benchmarkPayload || state.benchmarkPayload.weeks !== weeks) {
+        state.benchmarkPayload = await fetchJson(`${CONFIG.api.benchmarkPrices}?weeks=${weeks}`);
+      }
+      const benchmarks = state.benchmarkPayload && state.benchmarkPayload.benchmarks
+        ? state.benchmarkPayload.benchmarks
+        : {};
+      const kospi = benchmarks.KOSPI && benchmarks.KOSPI.prices ? benchmarks.KOSPI.prices : [];
+      const kosdaq = benchmarks.KOSDAQ && benchmarks.KOSDAQ.prices ? benchmarks.KOSDAQ.prices : [];
+      const sp500 = benchmarks.SNP500 && benchmarks.SNP500.prices ? benchmarks.SNP500.prices : [];
+      return [
+        { name: 'KOSPI', color: '#6c757d', width: 2, points: toDateSeries(kospi) },
+        { name: 'KOSDAQ', color: '#fd7e14', width: 2, points: toDateSeries(kosdaq) },
+        { name: 'S&P500', color: '#198754', width: 2, points: toDateSeries(sp500) },
+      ];
+    }
+
+    function extractPortfolioHoldingsPayload(portfolio) {
+      const raw = Array.isArray(portfolio && portfolio.holdings) ? portfolio.holdings : [];
+      return raw
+        .map((holding) => ({
+          code: String(holding.Code || '').trim(),
+          weight: Math.round(Number(holding.weight || 0)),
+        }))
+        .filter((item) => item.code && item.weight > 0);
+    }
+
+    async function loadPortfolioComparisonSeries(portfolio) {
+      const statusEl = document.getElementById('priceStatus');
+      statusEl.textContent = '포트폴리오/벤치마크 데이터를 불러오는 중...';
       try {
-        const data = await fetchJson(CONFIG.api.savedPortfolios);
-        state.savedPortfolios = Array.isArray(data.items) ? data.items : [];
-        select.innerHTML = '';
-        if (state.savedPortfolios.length === 0) {
-          const option = document.createElement('option');
-          option.value = '';
-          option.textContent = '저장된 포트 없음';
-          select.appendChild(option);
-        } else {
-          const placeholder = document.createElement('option');
-          placeholder.value = '';
-          placeholder.textContent = '포트 선택';
-          select.appendChild(placeholder);
-          for (const item of state.savedPortfolios) {
-            const option = document.createElement('option');
-            option.value = item.id;
-            option.textContent = item.name;
-            select.appendChild(option);
-          }
+        const holdings = extractPortfolioHoldingsPayload(portfolio);
+        if (holdings.length < 2) {
+          statusEl.textContent = '포트폴리오 구성 정보가 부족합니다.';
+          return;
         }
-        msg.textContent = '저장된 포트를 선택하세요.';
+        const [evalData, benchmarkSeries] = await Promise.all([
+          postJson(CONFIG.api.customPortfolioEval, { holdings }),
+          getBenchmarkSeries(26),
+        ]);
+        const portfolioSeries = {
+          name: '포트폴리오',
+          color: '#0d6efd',
+          width: 3.5,
+          points: toDateSeries(evalData.bh && evalData.bh.prices ? evalData.bh.prices : []),
+        };
+        const merged = alignSeriesByDate([portfolioSeries, ...benchmarkSeries]);
+        renderNormalizedPriceChart(merged.dates, merged.series, '누적수익률 (1.0 = 0%)');
+        statusEl.textContent = `${escapeHtml(portfolio.risk_bucket || '포트폴리오')} · 최근 26주`;
       } catch (err) {
-        msg.textContent = `불러오기 실패: ${err.message}`;
+        statusEl.textContent = `포트 비교 차트 로드 실패: ${err.message}`;
       }
     }
 
-    async function openSavedPortfolio() {
-      const select = document.getElementById('savedPortfolioSelect');
-      const msg = document.getElementById('savedPortfolioMsg');
-      if (!select || !msg) return;
-      const id = select.value;
-      if (!id) {
-        msg.textContent = '포트를 먼저 선택하세요.';
+    async function calculateCustomPortfolio() {
+      const total = Math.round(getCustomWeightSum());
+      const resultEl = document.getElementById('customResult');
+      if (state.customSelection.length < 2) {
+        showCustomMessage('2종목 이상 필요');
         return;
       }
-      msg.textContent = '상세 불러오는 중...';
+      if (total !== 100) {
+        showCustomMessage('비중 합계를 100%로 맞춰주세요.');
+        return;
+      }
+      showCustomMessage('');
+      if (resultEl) resultEl.innerHTML = '<span class="small-muted">계산 중...</span>';
       try {
-        const detail = await fetchJson(CONFIG.api.savedPortfolioDetail(id));
-        state.savedDetail = detail;
-        renderSavedPortfolioSummary(detail);
-        msg.textContent = '불러오기 완료.';
-      } catch (err) {
-        msg.textContent = `불러오기 실패: ${err.message}`;
-      }
-    }
+        const holdings = state.customSelection.map((item) => ({
+          code: item.Code,
+          weight: Math.round(Number(item.weight || 0)),
+        }));
+        const [evalData, benchmarkSeries] = await Promise.all([
+          postJson(CONFIG.api.customPortfolioEval, { holdings }),
+          getBenchmarkSeries(26),
+        ]);
+        state.customEval = evalData;
+        renderCustomBuilder();
+        renderPlot();
 
-    async function addTrade() {
-      const msg = document.getElementById('tradeMsg');
-      const select = document.getElementById('savedPortfolioSelect');
-      if (!msg || !select) return;
-      const portfolioId = select.value;
-      if (!portfolioId) {
-        msg.textContent = '포트를 먼저 선택하세요.';
-        return;
-      }
-      const codeInput = document.getElementById('tradeCode');
-      const sideInput = document.getElementById('tradeSide');
-      const qtyInput = document.getElementById('tradeQty');
-      const priceInput = document.getElementById('tradePrice');
-      const side = sideInput ? sideInput.value : '';
-      const code = codeInput ? codeInput.value.trim() : '';
-      const qty = Number(qtyInput ? qtyInput.value : 0);
-      const priceValue = priceInput ? priceInput.value : '';
-      const payload = {
-        code,
-        side,
-        qty: Math.floor(qty),
-      };
-      if (priceValue !== '') {
-        payload.price = Number(priceValue);
-      }
-      if (!side || qty <= 0) {
-        msg.textContent = '구분/수량을 확인하세요.';
-        return;
-      }
-      if (side !== 'CASH_IN' && !code) {
-        msg.textContent = '종목 코드를 입력하세요.';
-        return;
-      }
-      msg.textContent = '저장 중...';
-      try {
-        await postJson(CONFIG.api.savedPortfolioTrade(portfolioId), payload);
-        msg.textContent = '체결 입력 완료.';
-        await openSavedPortfolio();
+        const bhSeries = {
+          name: 'Custom BH',
+          color: '#6c757d',
+          width: 2.5,
+          points: toDateSeries(evalData.bh && evalData.bh.prices ? evalData.bh.prices : []),
+        };
+        const rbSeries = {
+          name: 'Custom RB',
+          color: '#0d6efd',
+          width: 3,
+          points: toDateSeries(evalData.rb && evalData.rb.prices ? evalData.rb.prices : []),
+        };
+        const merged = alignSeriesByDate([bhSeries, rbSeries, ...benchmarkSeries]);
+        renderNormalizedPriceChart(merged.dates, merged.series, '누적수익률 (1.0 = 0%)');
+        const statusEl = document.getElementById('priceStatus');
+        statusEl.textContent = 'Custom 포트 · 최근 26주';
       } catch (err) {
-        msg.textContent = `체결 입력 실패: ${err.message}`;
-      }
-    }
-
-    async function requestRebalancePlan() {
-      const msg = document.getElementById('rebalanceMsg');
-      const select = document.getElementById('savedPortfolioSelect');
-      if (!msg || !select) return;
-      const portfolioId = select.value;
-      if (!portfolioId) {
-        msg.textContent = '포트를 먼저 선택하세요.';
-        return;
-      }
-      if (!state.savedDetail || !Array.isArray(state.savedDetail.targets)) {
-        msg.textContent = '포트 상세를 먼저 불러오세요.';
-        return;
-      }
-      const bandInput = document.getElementById('rebalanceBand');
-      const bandPct = bandInput ? Number(bandInput.value || 5) : 5;
-      msg.textContent = '계산 중...';
-      try {
-        const plan = await postJson(CONFIG.api.savedPortfolioRebalancePlan(portfolioId), {
-          target_allocations: state.savedDetail.targets,
-          band_pct: bandPct,
-        });
-        state.savedRebalancePlan = plan;
-        renderRebalancePlan(plan);
-        msg.textContent = '플랜 생성 완료.';
-      } catch (err) {
-        msg.textContent = `플랜 실패: ${err.message}`;
-      }
-    }
-
-    async function commitRebalance() {
-      const msg = document.getElementById('rebalanceMsg');
-      const select = document.getElementById('savedPortfolioSelect');
-      if (!msg || !select) return;
-      const portfolioId = select.value;
-      if (!portfolioId) {
-        msg.textContent = '포트를 먼저 선택하세요.';
-        return;
-      }
-      if (!state.savedDetail || !Array.isArray(state.savedDetail.targets)) {
-        msg.textContent = '포트 상세를 먼저 불러오세요.';
-        return;
-      }
-      msg.textContent = '커밋 중...';
-      try {
-        await postJson(CONFIG.api.savedPortfolioRebalanceCommit(portfolioId), {
-          target_allocations: state.savedDetail.targets,
-          executed_trades: null,
-        });
-        msg.textContent = '커밋 완료.';
-        await openSavedPortfolio();
-      } catch (err) {
-        msg.textContent = `커밋 실패: ${err.message}`;
-      }
-    }
-
-    function updateTradeInputs() {
-      const sideInput = document.getElementById('tradeSide');
-      const codeInput = document.getElementById('tradeCode');
-      const priceInput = document.getElementById('tradePrice');
-      if (!sideInput || !codeInput || !priceInput) return;
-      const isCashIn = sideInput.value === 'CASH_IN';
-      codeInput.disabled = isCashIn;
-      priceInput.disabled = isCashIn;
-      if (isCashIn) {
-        codeInput.value = '';
-        priceInput.value = '';
+        if (resultEl) resultEl.innerHTML = `<span class="text-danger">계산 실패: ${escapeHtml(err.message)}</span>`;
       }
     }
 
@@ -1307,16 +1250,22 @@
         partialBanner.style.display =
           (scatter.meta && scatter.meta.is_current_week_partial) ? '' : 'none';
       }
-      state.portfolios = (Array.isArray(portfolios.items) ? portfolios.items : [])
+      const filterBuckets = (items) => (Array.isArray(items) ? items : [])
         .filter((item) => {
           const bucket = String(item.risk_bucket || '');
           if (bucket.startsWith('12')) return false;
           return Number(item.risk_pct) < 12;
         });
+      state.portfoliosBase = filterBuckets(portfolios.base || portfolios.items);
+      state.portfoliosDelta = filterBuckets(portfolios.delta || []);
+      state.portfolioMode = 'base';
+      state.portfolios = state.portfoliosBase;
       state.selectedCode = null;
       state.selectedPortfolioBucket = null;
 
+      renderModeTabs();
       renderRecommendCards();
+      renderCustomBuilder();
       renderSidebar(null);
       renderPlot();
       resetHoverInfo();
@@ -1326,14 +1275,12 @@
     function wireUI() {
       document.getElementById('btnResetSelection').addEventListener('click', clearSelection);
       document.getElementById('btnFindCode').addEventListener('click', handleSearch);
-      document.getElementById('btnSavePortfolio').addEventListener('click', handleSavePortfolio);
-      document.getElementById('btnLoadSavedPortfolios').addEventListener('click', loadSavedPortfolios);
-      document.getElementById('btnOpenSavedPortfolio').addEventListener('click', openSavedPortfolio);
-      document.getElementById('savedPortfolioSelect').addEventListener('change', openSavedPortfolio);
-      document.getElementById('btnAddTrade').addEventListener('click', addTrade);
-      document.getElementById('btnRebalancePlan').addEventListener('click', requestRebalancePlan);
-      document.getElementById('btnRebalanceCommit').addEventListener('click', commitRebalance);
-      document.getElementById('tradeSide').addEventListener('change', updateTradeInputs);
+      document.getElementById('btnCustomCalc').addEventListener('click', calculateCustomPortfolio);
+      document.getElementById('btnCustomReset').addEventListener('click', () => {
+        state.customSelection = [];
+        clearCustomEvaluation();
+        renderCustomBuilder();
+      });
       document.getElementById('codeInput').addEventListener('keydown', (ev) => {
         if (ev.key === 'Enter') {
           handleSearch();
@@ -1344,8 +1291,6 @@
     async function initFromBackend() {
       setLastUpdated();
       wireUI();
-      updateTradeInputs();
-      loadSavedPortfolios();
       await refreshFromBackend();
     }
 
@@ -1385,7 +1330,7 @@
       renderSidebar(found);
       updateBucketTabActive();
       renderPlot();
-      updatePricePanel(null);
+      loadPortfolioComparisonSeries(found);
     }
 
     function getEtfScatterIndex(code) {
@@ -1413,7 +1358,7 @@
       }, { notMerge: false, lazyUpdate: true, silent: true });
     }
 
-    function selectEtfByCode(code) {
+    function selectEtfByCode(code, options = {}) {
       const target = normalizeCode(code);
       const found = state.scatterItems.find((item) => normalizeCode(item.Code) === target);
       const msg = document.getElementById('searchMsg');
@@ -1430,55 +1375,15 @@
       updateBucketTabActive();
       focusEtfOnChartByCode(found.Code);
       loadPriceSeries(found);
+      if (options.addToCustom) {
+        addCustomHolding(found);
+      }
     }
 
     function handleSearch() {
       const input = document.getElementById('codeInput');
       if (!input) return;
       selectEtfByCode(input.value);
-    }
-
-    function getSelectedPortfolioAllocations() {
-      if (!state.selectedPortfolioBucket) return null;
-      const portfolio = state.portfolios.find((item) => item.risk_bucket === state.selectedPortfolioBucket);
-      if (!portfolio || !Array.isArray(portfolio.holdings) || portfolio.holdings.length === 0) {
-        return null;
-      }
-      return portfolio.holdings.map((holding) => ({
-        code: holding.Code,
-        name: holding.Name,
-        asset_class: holding.asset_class || classifyAssetClass(holding.Name),
-        target_weight_pct: Number(holding.weight),
-      }));
-    }
-
-    async function handleSavePortfolio() {
-      const nameInput = document.getElementById('savePortfolioName');
-      const budgetInput = document.getElementById('savePortfolioBudget');
-      const msg = document.getElementById('savePortfolioMsg');
-      if (!nameInput || !budgetInput || !msg) return;
-      const name = nameInput.value.trim();
-      if (!name) {
-        msg.textContent = '포트 이름을 입력하세요.';
-        return;
-      }
-      const targets = getSelectedPortfolioAllocations();
-      if (!targets) {
-        msg.textContent = '추천 포트를 먼저 선택하세요.';
-        return;
-      }
-      const budget = Number(budgetInput.value || 0);
-      msg.textContent = '저장 중...';
-      try {
-        await postJson(CONFIG.api.savedPortfolios, {
-          name,
-          initial_budget_krw: Math.max(0, Math.floor(budget)),
-          target_allocations: targets,
-        });
-        msg.textContent = '저장 완료!';
-      } catch (err) {
-        msg.textContent = `저장 실패: ${err.message}`;
-      }
     }
 
     function updateBucketTabActive() {
@@ -1495,7 +1400,7 @@
 
     function updatePricePanel(statusText) {
       const statusEl = document.getElementById('priceStatus');
-      statusEl.textContent = statusText || 'ETF를 선택하면 가격 추이가 표시됩니다.';
+      statusEl.textContent = statusText || 'ETF/포트 선택 시 최근 26주 가격 추이가 표시됩니다.';
       const chartEl = document.getElementById('priceChart');
       if (chartEl) {
         if (window.__priceChart) {
@@ -1513,7 +1418,7 @@
       const statusEl = document.getElementById('priceStatus');
       statusEl.textContent = '가격 데이터를 불러오는 중...';
       try {
-        const url = `${CONFIG.api.prices}?code=${encodeURIComponent(item.Code)}&days=120`;
+        const url = `${CONFIG.api.prices}?code=${encodeURIComponent(item.Code)}&weeks=26`;
         const data = await fetchJson(url);
         const items = Array.isArray(data.items) ? data.items : [];
         if (items.length === 0) {
@@ -1522,7 +1427,7 @@
         }
         const dates = items.map((row) => row.date);
         const closes = items.map((row) => row.close);
-        statusEl.textContent = `${escapeHtml(data.name || item.Name)} · 최근 ${items.length}일`;
+        statusEl.textContent = `${escapeHtml(data.name || item.Name)} · 최근 26주`;
         renderPriceChart(dates, closes);
       } catch (err) {
         statusEl.textContent = '가격 데이터를 불러오지 못했습니다.';
@@ -1530,15 +1435,37 @@
     }
 
     function renderPriceChart(dates, closes) {
+      const lineSeries = [{
+        name: '종가',
+        color: '#0d6efd',
+        width: 2.5,
+        data: closes,
+      }];
+      renderNormalizedPriceChart(dates, lineSeries, '가격');
+    }
+
+    function renderNormalizedPriceChart(dates, seriesDefs, yAxisName) {
       const chartEl = document.getElementById('priceChart');
       if (!window.__priceChart) {
         window.__priceChart = echarts.init(chartEl);
       }
-      const minVal = closes.length ? Math.min(...closes) : 0;
-      const maxVal = closes.length ? Math.max(...closes) : 0;
+      const values = [];
+      seriesDefs.forEach((s) => (s.data || []).forEach((v) => {
+        if (Number.isFinite(v)) values.push(v);
+      }));
+      const minVal = values.length ? Math.min(...values) : 0.8;
+      const maxVal = values.length ? Math.max(...values) : 1.2;
       const option = {
         animation: false,
         grid: { left: 40, right: 10, top: 8, bottom: 28, containLabel: true },
+        legend: {
+          show: seriesDefs.length > 1,
+          top: 0,
+          right: 4,
+          itemWidth: 10,
+          itemHeight: 2,
+          textStyle: { fontSize: 11 },
+        },
         xAxis: {
           type: 'category',
           data: dates,
@@ -1549,6 +1476,7 @@
         yAxis: {
           type: 'value',
           scale: true,
+          name: yAxisName || '',
           min: minVal * 0.98,
           max: maxVal * 1.02,
           axisLine: { lineStyle: { color: 'rgba(0,0,0,0.2)' } },
@@ -1557,8 +1485,7 @@
             formatter: (value) => {
               const num = Number(value);
               if (!Number.isFinite(num)) return value;
-              const digits = Math.abs(num) >= 1000 ? 0 : 2;
-              return num.toLocaleString(undefined, { maximumFractionDigits: digits });
+              return num.toFixed(2);
             },
           },
         },
@@ -1570,20 +1497,24 @@
           textStyle: { color: '#111827', fontSize: 12 },
           formatter: (params) => {
             if (!params || !params.length) return '';
-            const p = params[0];
-            return `${escapeHtml(p.axisValue)}<br>${Number(p.data).toFixed(2)}`;
+            const lines = [`${escapeHtml(params[0].axisValue)}`];
+            params.forEach((p) => {
+              const value = Number(p.data);
+              if (!Number.isFinite(value)) return;
+              lines.push(`${escapeHtml(p.seriesName)}: ${value.toFixed(3)}`);
+            });
+            return lines.join('<br>');
           },
         },
-        series: [
-          {
-            type: 'line',
-            data: closes,
-            smooth: true,
-            symbol: 'none',
-            lineStyle: { color: '#0d6efd', width: 2 },
-            areaStyle: { color: 'rgba(13,110,253,0.08)' },
-          },
-        ],
+        series: seriesDefs.map((item) => ({
+          name: item.name,
+          type: 'line',
+          data: item.data,
+          smooth: false,
+          connectNulls: false,
+          symbol: 'none',
+          lineStyle: { color: item.color, width: item.width || 2 },
+        })),
       };
       window.__priceChart.setOption(option, true);
       window.__priceChart.resize();
