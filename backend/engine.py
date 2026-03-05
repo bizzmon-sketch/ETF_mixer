@@ -2355,7 +2355,7 @@ def build_portfolio_qp(
         periods_per_year=int(scaling_policy["periods_per_year"]),
       )
       weights_for_52w = {h["Code"]: float(w) * 100.0 for h, w in zip(final_rows_out, final_weights)}
-      return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w)
+      return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w, returns_tail)
       risk_pct_rounded = round(risk_pct, 2) if risk_pct is not None else None
       adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
 
@@ -2502,7 +2502,7 @@ def build_portfolio_qp(
               periods_per_year=int(scaling_policy["periods_per_year"]),
             )
             weights_for_52w = {h["Code"]: float(w) * 100.0 for h, w in zip(final_rows_out, final_weights)}
-            return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w)
+            return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w, returns_tail)
             risk_pct_rounded = round(risk_pct, 2) if risk_pct is not None else None
             adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
             final_hash = _compute_final_hash(
@@ -2627,6 +2627,7 @@ def build_portfolio_qp(
       "risk_bucket": bucket_label,
       "risk_pct": success_payload["risk_pct"],
       "return_6m": success_payload["return_6m"],
+      "return_52w": success_payload.get("return_52w"),
       "sharpe_120d": success_payload["sharpe_120d"],
       "sharpe_window": success_payload["sharpe_window"],
       "holdings": success_payload["holdings"],
@@ -2753,8 +2754,9 @@ def _compute_portfolio_metrics(
 def _compute_portfolio_52w_metrics(
   holdings: List[Dict[str, object]],
   weights: Dict[str, int],
+  weekly_returns_ext: "pd.DataFrame | None" = None,
 ) -> Tuple[float | None, float | None, float | None]:
-  weekly_returns = _CACHE.get("returns_tail")
+  weekly_returns = weekly_returns_ext if weekly_returns_ext is not None else _CACHE.get("returns_tail")
   if not isinstance(weekly_returns, pd.DataFrame) or weekly_returns.empty:
     return None, None, None
   codes = [
