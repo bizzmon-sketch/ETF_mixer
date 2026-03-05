@@ -268,6 +268,183 @@ def rebalance_commit(portfolio_id: str):
   return jsonify(result)
 
 
+def _safe_float(value: object) -> float | None:
+  try:
+    return float(value)
+  except (TypeError, ValueError):
+    return None
+
+
+def _is_multiple_of_5(value: float) -> bool:
+  if value is None:
+    return False
+  return abs((value / 5.0) - round(value / 5.0)) < 1e-9
+
+
+def _load_weekly_prices(codes: list[str], weeks: int) -> object:
+  end = engine.pd.Timestamp.today().normalize()
+  # 26주 + 리샘플 여유분 확보를 위해 9개월 범위를 조회한다.
+  start = end - engine.pd.DateOffset(months=9)
+  daily = engine.load_close_prices(codes, start, end)
+  if daily is None or daily.empty:
+    return engine.pd.DataFrame()
+  weekly = daily.resample("W-FRI", label="right", closed="right").last().sort_index()
+  if weeks > 0 and len(weekly) > (weeks + 1):
+    weekly = weekly.tail(weeks + 1)
+  return weekly
+
+
+def _format_price_series(series: object) -> list[dict[str, object]]:
+  if series is None or len(series) == 0:
+    return []
+  base = float(series.iloc[0])
+  if base <= 0:
+    return []
+  normalized = series / base
+  items = []
+  for idx, value in normalized.items():
+    items.append({
+      "date": idx.strftime("%Y-%m-%d"),
+      "value": round(float(value), 6),
+    })
+  return items
+
+
+@app.post("/api/custom_portfolio_eval")
+def custom_portfolio_eval():
+  payload = request.get_json(silent=True) or {}
+  holdings_raw = payload.get("holdings") or []
+  if not isinstance(holdings_raw, list):
+    return jsonify({"error": "invalid_holdings", "message": "holdings 형식이 올바르지 않습니다"}), 400
+  if not (2 <= len(holdings_raw) <= 6):
+    return jsonify({"error": "invalid_count", "message": "종목 수는 2~6개여야 합니다"}), 400
+
+  codes: list[str] = []
+  weights: list[float] = []
+  seen = set()
+  cleaned_holdings = []
+  for item in holdings_raw:
+    if not isinstance(item, dict):
+      return jsonify({"error": "invalid_holdings", "message": "holdings 형식이 올바르지 않습니다"}), 400
+    code = str(item.get("code", "")).strip()
+    if not code:
+      return jsonify({"error": "invalid_code", "message": "종목 코드가 비어 있습니다"}), 400
+    if code in seen:
+      return jsonify({"error": "duplicate_code", "message": "중복 종목 코드는 허용되지 않습니다"}), 400
+    weight = _safe_float(item.get("weight"))
+    if weight is None:
+      return jsonify({"error": "invalid_weight", "message": "비중 형식이 올바르지 않습니다"}), 400
+    if not _is_multiple_of_5(weight):
+      return jsonify({"error": "weight_not_5pct", "message": "비중은 5% 단위여야 합니다"}), 400
+    seen.add(code)
+    codes.append(code)
+    weights.append(weight)
+    cleaned_holdings.append({
+      "code": code,
+      "weight": int(round(weight)),
+    })
+
+  total_weight = float(sum(weights))
+  if abs(total_weight - 100.0) > 1e-9:
+    return jsonify({
+      "error": "weights_not_100",
+      "message": "비중 합계가 100%가 아닙니다",
+      "total": round(total_weight, 6),
+    }), 400
+
+  weekly_prices = _load_weekly_prices(codes, 26)
+  if weekly_prices.empty:
+    return jsonify({"error": "code_not_found", "message": "DB에 없는 종목 코드가 포함되어 있습니다"}), 400
+  missing_codes = [code for code in codes if code not in weekly_prices.columns]
+  if missing_codes:
+    return jsonify({
+      "error": "code_not_found",
+      "message": "DB에 없는 종목 코드가 포함되어 있습니다",
+      "codes": missing_codes,
+    }), 400
+
+  aligned = weekly_prices[codes].dropna(how="any")
+  if len(aligned) < 27:
+    return jsonify({
+      "error": "insufficient_data",
+      "message": "26주 계산에 필요한 주봉 데이터가 부족합니다",
+    }), 400
+  prices_26w = aligned.tail(27)
+  returns_26w = engine.np.log(prices_26w / prices_26w.shift(1)).dropna(how="any")
+
+  bh_return, bh_risk, bh_sharpe, bh_prices = engine.compute_custom_portfolio_bh(codes, weights, returns_26w)
+  rb_return, rb_risk, rb_sharpe, rb_prices = engine.compute_custom_portfolio_rb(codes, weights, prices_26w)
+
+  response = {
+    "holdings": cleaned_holdings,
+    "bh": {
+      "return_26w": bh_return,
+      "risk_pct": bh_risk,
+      "sharpe": bh_sharpe,
+      "prices": bh_prices,
+    },
+    "rb": {
+      "return_26w": rb_return,
+      "risk_pct": rb_risk,
+      "sharpe": rb_sharpe,
+      "prices": rb_prices,
+    },
+    "scatter_point": {
+      "bh": {
+        "x": bh_risk,
+        "y": round(bh_return * 100.0, 4),
+        "sharpe": bh_sharpe,
+      },
+      "rb": {
+        "x": rb_risk,
+        "y": round(rb_return * 100.0, 4),
+        "sharpe": rb_sharpe,
+      },
+    },
+  }
+  return jsonify(response)
+
+
+@app.get("/api/benchmark_prices")
+def benchmark_prices():
+  weeks_raw = (request.args.get("weeks", "26") or "26").strip()
+  try:
+    weeks = int(weeks_raw)
+  except ValueError:
+    weeks = 26
+  if weeks <= 0:
+    weeks = 26
+
+  benchmarks = {
+    "KOSPI": "069500",
+    "KOSDAQ": "229200",
+    "SNP500": "360750",
+  }
+  codes = list(benchmarks.values())
+  weekly_prices = _load_weekly_prices(codes, weeks)
+
+  result = {}
+  for label, code in benchmarks.items():
+    if weekly_prices.empty or code not in weekly_prices.columns:
+      result[label] = None
+      continue
+    series = weekly_prices[code].dropna()
+    if len(series) < 2:
+      result[label] = None
+      continue
+    if len(series) > (weeks + 1):
+      series = series.tail(weeks + 1)
+    result[label] = {
+      "code": code,
+      "prices": _format_price_series(series),
+    }
+
+  return jsonify({
+    "weeks": weeks,
+    "benchmarks": result,
+  })
+
+
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=5000, debug=True)
 

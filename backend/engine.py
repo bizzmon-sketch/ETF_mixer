@@ -3342,6 +3342,139 @@ def get_price_series(code: str, days: int = 120) -> Dict[str, object]:
   }
 
 
+def compute_custom_portfolio_bh(
+  codes: List[str],
+  weights: List[float],
+  returns_weekly_26w: pd.DataFrame,
+) -> Tuple[float, float, float | None, List[Dict[str, object]]]:
+  if returns_weekly_26w is None or returns_weekly_26w.empty:
+    return 0.0, 0.0, None, []
+  if not codes or not weights or len(codes) != len(weights):
+    return 0.0, 0.0, None, []
+
+  missing = [code for code in codes if code not in returns_weekly_26w.columns]
+  if missing:
+    return 0.0, 0.0, None, []
+
+  weights_arr = np.array(weights, dtype=float)
+  total = float(weights_arr.sum())
+  if total <= 0:
+    return 0.0, 0.0, None, []
+  weights_arr = weights_arr / total
+
+  selected = returns_weekly_26w[codes].dropna(how="any")
+  if selected.empty:
+    return 0.0, 0.0, None, []
+
+  portfolio_log = selected.dot(weights_arr)
+  if portfolio_log.empty:
+    return 0.0, 0.0, None, []
+
+  cumulative = np.exp(portfolio_log.cumsum())
+  if float(cumulative.iloc[0]) == 0.0:
+    normalized = cumulative
+  else:
+    normalized = cumulative / float(cumulative.iloc[0])
+
+  prices = []
+  for idx, value in normalized.items():
+    prices.append({
+      "date": idx.strftime("%Y-%m-%d"),
+      "value": round(float(value), 6),
+    })
+
+  return_26w = float(np.exp(float(portfolio_log.sum())) - 1.0)
+  if len(portfolio_log) < 2:
+    return round(return_26w, 6), 0.0, None, prices
+
+  std = float(portfolio_log.std(ddof=1))
+  if std < 1e-12:
+    return round(return_26w, 6), 0.0, None, prices
+
+  risk_pct = float(std * _WEEKLY_SCALE_TO_MONTHLY * 100.0)
+  sharpe = float((float(portfolio_log.mean()) - _RF_WEEKLY) / std * np.sqrt(_WEEKLY_PERIODS_PER_YEAR))
+  return round(return_26w, 6), round(risk_pct, 4), round(sharpe, 4), prices
+
+
+def compute_custom_portfolio_rb(
+  codes: List[str],
+  weights: List[float],
+  prices_weekly_26w: pd.DataFrame,
+) -> Tuple[float, float, float | None, List[Dict[str, object]]]:
+  if prices_weekly_26w is None or prices_weekly_26w.empty:
+    return 0.0, 0.0, None, []
+  if not codes or not weights or len(codes) != len(weights):
+    return 0.0, 0.0, None, []
+
+  missing = [code for code in codes if code not in prices_weekly_26w.columns]
+  if missing:
+    return 0.0, 0.0, None, []
+
+  weekly_prices = prices_weekly_26w[codes].dropna(how="any")
+  if len(weekly_prices) < 2:
+    return 0.0, 0.0, None, []
+
+  weights_arr = np.array(weights, dtype=float)
+  total = float(weights_arr.sum())
+  if total <= 0:
+    return 0.0, 0.0, None, []
+  target_alloc = weights_arr / total
+
+  first_prices = weekly_prices.iloc[0].to_numpy(dtype=float)
+  if np.any(first_prices <= 0):
+    return 0.0, 0.0, None, []
+
+  wealth_series = [1.0]
+  date_series = [weekly_prices.index[0]]
+  shares = target_alloc / first_prices
+
+  # 4주마다 리밸런싱, 리밸런싱 시점 거래대금의 0.1%를 비용으로 차감한다.
+  for row_idx in range(1, len(weekly_prices)):
+    current_prices = weekly_prices.iloc[row_idx].to_numpy(dtype=float)
+    current_values = shares * current_prices
+    wealth_pre = float(current_values.sum())
+    wealth_post = wealth_pre
+
+    if row_idx % 4 == 0 and row_idx < (len(weekly_prices) - 1):
+      target_values = wealth_pre * target_alloc
+      turnover = float(np.abs(target_values - current_values).sum())
+      trading_cost = turnover * 0.001
+      wealth_post = max(wealth_pre - trading_cost, 0.0)
+      if wealth_post > 0.0 and np.all(current_prices > 0):
+        shares = (wealth_post * target_alloc) / current_prices
+
+    wealth_series.append(wealth_post)
+    date_series.append(weekly_prices.index[row_idx])
+
+  wealth = pd.Series(wealth_series, index=pd.DatetimeIndex(date_series))
+  if wealth.empty:
+    return 0.0, 0.0, None, []
+
+  prices = []
+  for idx, value in wealth.items():
+    prices.append({
+      "date": idx.strftime("%Y-%m-%d"),
+      "value": round(float(value), 6),
+    })
+
+  log_returns = np.log(wealth / wealth.shift(1)).dropna()
+  if log_returns.empty:
+    return_26w = float(wealth.iloc[-1] - 1.0)
+    return round(return_26w, 6), 0.0, None, prices
+
+  return_26w = float(np.exp(float(log_returns.sum())) - 1.0)
+  if len(log_returns) < 2:
+    return round(return_26w, 6), 0.0, None, prices
+
+  std = float(log_returns.std(ddof=1))
+  if std < 1e-12:
+    return round(return_26w, 6), 0.0, None, prices
+
+  risk_pct = float(std * _WEEKLY_SCALE_TO_MONTHLY * 100.0)
+  sharpe = float((float(log_returns.mean()) - _RF_WEEKLY) / std * np.sqrt(_WEEKLY_PERIODS_PER_YEAR))
+  return round(return_26w, 6), round(risk_pct, 4), round(sharpe, 4), prices
+
+
 if __name__ == "__main__":
   _refresh_cache_from_db()
   print("scatter rows:", len(get_scatter_data()))
