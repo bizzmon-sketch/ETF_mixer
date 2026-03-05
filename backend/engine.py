@@ -2355,8 +2355,8 @@ def build_portfolio_qp(
         periods_per_year=int(scaling_policy["periods_per_year"]),
       )
       weights_for_52w = {h["Code"]: float(w) * 100.0 for h, w in zip(final_rows_out, final_weights)}
-      return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w, returns_tail)
-      risk_pct_rounded = round(risk_pct, 2) if risk_pct is not None else None
+      return_52w, sharpe_52w, _ = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w, returns_tail)
+      risk_pct_rounded = round(float(final_risk) * 100.0, 2)
       adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
 
       final_hash = _compute_final_hash(
@@ -2502,8 +2502,8 @@ def build_portfolio_qp(
               periods_per_year=int(scaling_policy["periods_per_year"]),
             )
             weights_for_52w = {h["Code"]: float(w) * 100.0 for h, w in zip(final_rows_out, final_weights)}
-            return_52w, sharpe_52w, risk_pct = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w, returns_tail)
-            risk_pct_rounded = round(risk_pct, 2) if risk_pct is not None else None
+            return_52w, sharpe_52w, _ = _compute_portfolio_52w_metrics(final_rows_out, weights_for_52w, returns_tail)
+            risk_pct_rounded = round(float(final_risk) * 100.0, 2)
             adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
             final_hash = _compute_final_hash(
               final_weights,
