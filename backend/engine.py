@@ -1185,6 +1185,58 @@ def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> 
   return pools
 
 
+def _build_delta_candidate_pools(
+  metrics: pd.DataFrame,
+  returns_tail: pd.DataFrame,
+  config: Dict[str, object],
+) -> Dict[str, List[Dict[str, object]]]:
+  if returns_tail is None or returns_tail.empty or len(returns_tail.index) < 26:
+    return _build_candidate_pools(metrics, config)
+  df = metrics.dropna(subset=["Code", "Name", "return_6m", "risk_pct", "sharpe_120d"]).copy()
+  if df.empty:
+    return {}
+  df["asset_class"] = df["Name"].apply(classify_asset_class)
+  recent_13w = returns_tail.iloc[-13:]
+  prev_13w = returns_tail.iloc[-26:-13]
+  momentum = (recent_13w.mean(axis=0) - prev_13w.mean(axis=0))
+  momentum_map = {
+    str(code): float(value)
+    for code, value in momentum.items()
+    if pd.notna(value)
+  }
+  df["momentum"] = df["Code"].astype(str).map(momentum_map).fillna(0.0)
+  try:
+    topn_delta = int(config.get("topN_by_class_delta", 30))
+  except Exception:
+    topn_delta = 30
+  topn_delta = max(1, topn_delta)
+  pools: Dict[str, List[Dict[str, object]]] = {}
+  for asset_class in ASSET_CLASSES:
+    class_df = df[df["asset_class"] == asset_class]
+    if class_df.empty:
+      pools[asset_class] = []
+      continue
+    selected = class_df.sort_values(
+      ["momentum", "sharpe_120d", "return_6m", "risk_pct", "Code"],
+      ascending=[False, False, False, True, True],
+    ).head(topn_delta)
+    pools[asset_class] = [
+      {
+        "Code": row["Code"],
+        "Name": row["Name"],
+        "return_52w": float(row.get("return_52w") or row["return_6m"]),
+        "return_6m": float(row["return_6m"]),
+        "risk_pct": float(row["risk_pct"]),
+        "sharpe_window": float(row["sharpe_120d"]),
+        "mean_log_r_ann": float(row.get("mean_log_r_ann") or 0.0),
+        "asset_class": asset_class,
+        "momentum": float(row.get("momentum") or 0.0),
+      }
+      for _, row in selected.iterrows()
+    ]
+  return pools
+
+
 def _normalize_weights(weights: np.ndarray) -> np.ndarray:
   weights = np.array(weights, dtype=float)
   total = float(np.sum(weights))
@@ -1897,7 +1949,12 @@ def build_portfolio_qp(
     "alignment_drop_pct": None,
   }
 
-  pools = _build_candidate_pools(metrics, config)
+  if mode == "delta" and returns_tail is not None:
+    pools = _build_delta_candidate_pools(metrics, returns_tail, config)
+    meta["delta_pool"] = "momentum_top30"
+  else:
+    pools = _build_candidate_pools(metrics, config)
+    meta["delta_pool"] = "sharpe_top20"
   by_class_counts = {asset_class: len(pools.get(asset_class, [])) for asset_class in ASSET_CLASSES}
   required_classes: List[str] = []
   relaxed_classes: List[str] = []
@@ -1913,6 +1970,13 @@ def build_portfolio_qp(
         continue
       holdings_rows.append(dict(row))
       used_codes.add(code)
+  if mode == "delta" and meta.get("delta_pool") == "momentum_top30":
+    try:
+      topn_delta_meta = int(config.get("topN_by_class_delta", 30))
+    except Exception:
+      topn_delta_meta = 30
+    meta["delta_pool_size"] = int(len(holdings_rows))
+    meta["delta_topN"] = int(max(1, topn_delta_meta))
 
   qp_audit = None
   if debug:
