@@ -1968,7 +1968,7 @@ def build_portfolio_qp(
     "alignment_drop_pct": None,
   }
 
-  if mode == "delta":
+  if mode == "delta" and returns_tail is not None:
     pools = _build_delta_candidate_pools(metrics, returns_tail, config)
     meta["delta_pool"] = "forecast_sharpe_top20"
   else:
