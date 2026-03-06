@@ -1191,19 +1191,16 @@ def _build_delta_candidate_pools(
   config: Dict[str, object],
 ) -> Dict[str, List[Dict[str, object]]]:
   # returns_tail 부족 시 base 후보풀로 fallback
-  if returns_tail is None or len(returns_tail.index) < 14:
+  if returns_tail is None or len(returns_tail.index) < 13:
     return _build_candidate_pools(metrics, config)
 
-  # 1. 최근 13주를 뒤에 붙여서 forecast_returns 생성
-  recent_13w = returns_tail.iloc[-13:]
-  forecast_returns = pd.concat([returns_tail, recent_13w], ignore_index=True)
-  # 마지막 52주 슬라이스 (52, N) shape 유지
-  forecast_returns = forecast_returns.iloc[-52:]
-
-  # 2. forecast 지표 계산 (base와 동일 방식)
-  mu_forecast = forecast_returns.mean()
-  sigma_forecast = forecast_returns.std()
-  forecast_sharpe = mu_forecast / sigma_forecast.clip(lower=1e-8)
+  # 최근 52주 기반 mu 혼합형 score (mu_delta/sigma52 * sqrt(52))
+  rt52 = returns_tail.iloc[-52:]
+  mu52_week = rt52.mean()
+  mu13_week = rt52.iloc[-13:].mean()
+  mu_delta_week = 0.7 * mu52_week + 0.3 * mu13_week
+  sigma52_week = rt52.std()
+  delta_score = (mu_delta_week / sigma52_week.clip(lower=1e-8)) * (52 ** 0.5)
 
   # 3. metrics 유효 종목 필터 (base와 동일)
   df = metrics.dropna(
@@ -1213,23 +1210,13 @@ def _build_delta_candidate_pools(
     return {}
   df["asset_class"] = df["Name"].apply(classify_asset_class)
 
-  # 4. forecast_sharpe join
-  fs_df = forecast_sharpe.rename("forecast_sharpe").reset_index()
-  fs_df.columns = ["Code", "forecast_sharpe"]
-  df = df.merge(fs_df, on="Code", how="left")
-  df["forecast_sharpe"] = df["forecast_sharpe"].fillna(0.0)
+  # delta_score join
+  score_df = delta_score.rename("delta_score").reset_index()
+  score_df.columns = ["Code", "delta_score"]
+  df = df.merge(score_df, on="Code", how="left")
+  df["delta_score"] = df["delta_score"].fillna(0.0)
 
-  # 5. forecast_returns 기반으로 risk_pct 재계산
-  #    (base의 risk_pct는 과거 52주 기준이므로 forecast 기준으로 교체)
-  scale_to_monthly = (52 ** 0.5) / (12 ** 0.5)
-  risk_forecast = sigma_forecast * scale_to_monthly * 100
-  risk_df = risk_forecast.rename("risk_pct_forecast").reset_index()
-  risk_df.columns = ["Code", "risk_pct_forecast"]
-  df = df.merge(risk_df, on="Code", how="left")
-  # risk_pct_forecast가 있으면 사용, 없으면 기존 risk_pct 유지
-  df["risk_pct_use"] = df["risk_pct_forecast"].fillna(df["risk_pct"])
-
-  # 6. 자산군별 forecast_sharpe 상위 topN개 선택 (base와 동일 구조)
+  # 자산군별 delta_score 상위 topN 선택
   topn_config = config.get("topN_by_class", 50)
   pools: Dict[str, List[Dict[str, object]]] = {}
   for asset_class in ASSET_CLASSES:
@@ -1238,18 +1225,18 @@ def _build_delta_candidate_pools(
       pools[asset_class] = []
       continue
     topn = int(topn_config) if not isinstance(topn_config, dict) else int(topn_config.get(asset_class, 50))
-    selected = class_df.sort_values("forecast_sharpe", ascending=False).head(topn)
+    selected = class_df.sort_values("delta_score", ascending=False).head(topn)
     pools[asset_class] = [
       {
         "Code": str(row["Code"]),
         "Name": str(row["Name"]),
         "return_52w": float(row.get("return_52w") or row["return_6m"]),
         "return_6m": float(row["return_6m"]),
-        "risk_pct": float(row["risk_pct_use"]),
+        "risk_pct": float(row["risk_pct"]),
         "sharpe_window": float(row["sharpe_120d"]),
         "mean_log_r_ann": float(row.get("mean_log_r_ann") or 0.0),
         "asset_class": asset_class,
-        "forecast_sharpe": float(row["forecast_sharpe"]),
+        "delta_score": float(row["delta_score"]),
       }
       for _, row in selected.iterrows()
     ]
@@ -1970,7 +1957,7 @@ def build_portfolio_qp(
 
   if mode == "delta" and returns_tail is not None:
     pools = _build_delta_candidate_pools(metrics, returns_tail, config)
-    meta["delta_pool"] = "forecast_sharpe_top50"
+    meta["delta_pool"] = "mu_mix_top50"
   else:
     pools = _build_candidate_pools(metrics, config)
     meta["delta_pool"] = "sharpe_top20"
@@ -1989,7 +1976,7 @@ def build_portfolio_qp(
         continue
       holdings_rows.append(dict(row))
       used_codes.add(code)
-  if mode == "delta" and meta.get("delta_pool") == "forecast_sharpe_top50":
+  if mode == "delta" and meta.get("delta_pool") == "mu_mix_top50":
     topn_cfg_meta = config.get("topN_by_class", 50)
     try:
       if isinstance(topn_cfg_meta, dict):
@@ -2224,20 +2211,18 @@ def build_portfolio_qp(
 
   sigma_qp = sigma
   delta_meta_fields: Dict[str, object] = {}
-  if mode == "delta" and returns_tail is not None and len(returns_tail) >= 14:
-    recent_13w = returns_tail.reindex(columns=codes).fillna(0.0).iloc[-13:]
-    forecast_rt = pd.concat(
-      [returns_slice_all, recent_13w.reindex(columns=codes).fillna(0.0)],
-      ignore_index=True,
-    ).iloc[-52:]
+  if mode == "delta" and returns_tail is not None and len(returns_tail) >= 13:
+    mu52_week = returns_slice_all.mean().reindex(codes).fillna(0.0)
+    mu13_week = returns_slice_all.iloc[-13:].mean().reindex(codes).fillna(0.0)
+    mu_delta_week = 0.7 * mu52_week + 0.3 * mu13_week
+    mu = (mu_delta_week * 52.0).to_numpy(dtype=float)
 
-    mu = forecast_rt.mean().reindex(codes).fillna(0.0).to_numpy(dtype=float)
-    sigma_qp = forecast_rt.cov().values
+    sigma_qp = returns_slice_all.cov().values
     sigma_qp = (sigma_qp + sigma_qp.T) / 2
 
     delta_meta_fields = {
-      "delta_mode": "pattern_repeat_13w",
-      "delta_pool": "forecast_sharpe_top50",
+      "delta_mode": "mu_mix_70_30",
+      "delta_pool": "mu_mix_top50",
     }
     meta.update(delta_meta_fields)
     for idx, row in enumerate(holdings_rows):
@@ -2245,8 +2230,8 @@ def build_portfolio_qp(
   elif mode == "delta":
     mu = returns_slice_all.mean(axis=0).reindex(codes).fillna(0.0).to_numpy(dtype=float)
     delta_meta_fields = {
-      "delta_mode": "pattern_repeat_13w",
-      "delta_pool": "forecast_sharpe_top50",
+      "delta_mode": "mu_mix_70_30",
+      "delta_pool": "mu_mix_top50",
       "delta_fallback_reason": "insufficient_data",
     }
     meta.update(delta_meta_fields)
@@ -2738,8 +2723,8 @@ def build_portfolio_qp(
     })
 
   if mode == "delta":
-    delta_mode_value = str(meta.get("delta_mode") or "pattern_repeat_13w")
-    delta_pool_value = str(meta.get("delta_pool") or "forecast_sharpe_top50")
+    delta_mode_value = str(meta.get("delta_mode") or "mu_mix_70_30")
+    delta_pool_value = str(meta.get("delta_pool") or "mu_mix_top50")
     delta_candidate_count = int(len(holdings_rows))
     delta_feasible_total = 0
     precomputed_reason = str(meta.get("delta_fallback_reason") or "")
@@ -3380,12 +3365,12 @@ def generate_portfolios(
     delta_mode_value = (
       str((delta_meta or {}).get("delta_mode"))
       if isinstance(delta_meta, dict) and (delta_meta or {}).get("delta_mode") is not None
-      else "pattern_repeat_13w"
+      else "mu_mix_70_30"
     )
     delta_pool_value = (
       str((delta_meta or {}).get("delta_pool"))
       if isinstance(delta_meta, dict) and (delta_meta or {}).get("delta_pool") is not None
-      else "forecast_sharpe_top50"
+      else "mu_mix_top50"
     )
     delta_candidate_count_value = (
       int((delta_meta or {}).get("delta_candidate_count"))
