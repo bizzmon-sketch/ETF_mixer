@@ -2135,22 +2135,53 @@ def build_portfolio_qp(
       meta["qp_audit"] = qp_audit
     return items, meta
 
-  sharpe_13w_cache = _CACHE.get("sharpe_13w")
-  if isinstance(sharpe_13w_cache, pd.Series):
-    sharpe_13w = sharpe_13w_cache.to_dict()
-  elif isinstance(sharpe_13w_cache, dict):
-    sharpe_13w = sharpe_13w_cache
-  else:
-    sharpe_13w = {}
+  sigma_qp = sigma
+  delta_meta_fields: Dict[str, object] = {}
   if mode == "delta":
-    for row in holdings_rows:
-      code = str(row.get("Code") or "")
-      s_now = float(row.get("sharpe_window") or 0.0)
-      s_old = float(sharpe_13w.get(code, s_now))
-      delta = s_now - s_old
-      risk_floor = max(float(row.get("risk_pct") or 0.0), 2.0)
-      row["qp_score"] = s_now + 0.5 * (delta / risk_floor)
-    mu = np.array([float(h.get("qp_score") or 0.0) for h in holdings_rows], dtype=float)
+    lam = 1.0
+    mu_base = returns_slice_all.mean(axis=0).reindex(codes).fillna(0.0).to_numpy(dtype=float)
+    if len(returns_slice_all.index) < 26:
+      mu = mu_base
+      meta["delta_fallback_reason"] = "insufficient_data"
+      meta["delta_mode"] = "forecast_13w"
+      meta["delta_lambda"] = float(lam)
+      meta["delta_momentum_mean"] = None
+      meta["delta_vol_scale_mean"] = None
+      delta_meta_fields = {
+        "delta_mode": "forecast_13w",
+        "delta_lambda": float(lam),
+        "delta_momentum_mean": None,
+        "delta_vol_scale_mean": None,
+        "delta_fallback_reason": "insufficient_data",
+      }
+    else:
+      recent_13w = returns_slice_all.iloc[-13:]
+      prev_13w = returns_slice_all.iloc[-26:-13]
+      momentum = (recent_13w.mean(axis=0) - prev_13w.mean(axis=0)).reindex(codes).fillna(0.0)
+      contribution = lam * momentum.to_numpy(dtype=float)
+      cap = 0.5 * np.abs(mu_base)
+      contribution = np.clip(contribution, -cap, cap)
+      mu_forecast = mu_base + contribution
+
+      vol_base = returns_slice_all.std(axis=0).reindex(codes).fillna(0.0).to_numpy(dtype=float)
+      vol_recent = recent_13w.std(axis=0).reindex(codes).fillna(0.0).to_numpy(dtype=float)
+      vol_scale = (vol_recent / np.maximum(vol_base, 1e-8)) ** 0.5
+      vol_scale = np.clip(vol_scale, 0.5, 2.0)
+      D = np.diag(vol_scale)
+      sigma_forecast = D @ sigma @ D
+      sigma_forecast = (sigma_forecast + sigma_forecast.T) / 2
+
+      mu = mu_forecast
+      sigma_qp = sigma_forecast
+      delta_meta_fields = {
+        "delta_mode": "forecast_13w",
+        "delta_lambda": float(lam),
+        "delta_momentum_mean": float(momentum.mean()),
+        "delta_vol_scale_mean": float(np.mean(vol_scale)),
+      }
+      meta.update(delta_meta_fields)
+    for idx, row in enumerate(holdings_rows):
+      row["qp_score"] = float(mu[idx])
   else:
     for row in holdings_rows:
       row["qp_score"] = float(row.get("mean_log_r_ann") or 0.0)
@@ -2224,7 +2255,7 @@ def build_portfolio_qp(
 
       weights, solve_diag = _qp_solve_weights(
         mu,
-        sigma,
+        sigma_qp,
         gamma,
         lower_bounds=np.full(len(holdings_rows), min_weight_attempt, dtype=float)
         if len(holdings_rows) <= int(round(1.0 / min_weight_attempt))
@@ -2265,7 +2296,7 @@ def build_portfolio_qp(
       selected_codes = [h["Code"] for h in selected_rows]
       upper_selected = np.full(len(selected_rows), 0.4, dtype=float)
       sel_sigma_idx = [codes.index(c) for c in selected_codes]
-      sel_sigma = sigma[np.ix_(sel_sigma_idx, sel_sigma_idx)]
+      sel_sigma = sigma_qp[np.ix_(sel_sigma_idx, sel_sigma_idx)]
 
       cont_w_sel = _normalize_weights(best_weights[selected_indices])
       fallback_rows = selected_rows
@@ -2343,7 +2374,7 @@ def build_portfolio_qp(
       constraints_met = len(missing_required_classes) == 0
 
       pos_sigma_idx = [codes.index(str(h["Code"])) for h in final_rows_out]
-      pos_sigma = sigma[np.ix_(pos_sigma_idx, pos_sigma_idx)]
+      pos_sigma = sigma_qp[np.ix_(pos_sigma_idx, pos_sigma_idx)]
       final_risk = _portfolio_risk_pct(
         final_weights, pos_sigma,
         scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
@@ -2393,6 +2424,7 @@ def build_portfolio_qp(
         "holdings": holdings_output,
         "meta": {
           "gamma": gamma,
+          **delta_meta_fields,
           "within_bucket": within_bucket_flag,
           "feasible_in_band": feasible_in_band,
           "fallback_used": fallback_used,
@@ -2490,7 +2522,7 @@ def build_portfolio_qp(
             constraints_met = len(missing_required_classes) == 0
 
             pos_sigma_idx = [codes.index(str(h["Code"])) for h in final_rows_out]
-            pos_sigma = sigma[np.ix_(pos_sigma_idx, pos_sigma_idx)]
+            pos_sigma = sigma_qp[np.ix_(pos_sigma_idx, pos_sigma_idx)]
             final_risk = _portfolio_risk_pct(
               final_weights, pos_sigma,
               scale_to_monthly=float(scaling_policy["scale_to_monthly"]),
@@ -2540,6 +2572,7 @@ def build_portfolio_qp(
               "holdings": holdings_output,
               "meta": {
                 "gamma": gamma,
+                **delta_meta_fields,
                 "within_bucket": within_bucket_flag,
                 "feasible_in_band": within_bucket_flag,
                 "fallback_used": True,
@@ -3195,6 +3228,44 @@ def generate_portfolios(
       mode="delta",
       debug=bool(debug),
     )
+    delta_mode_value = (
+      str((delta_meta or {}).get("delta_mode"))
+      if isinstance(delta_meta, dict) and (delta_meta or {}).get("delta_mode") is not None
+      else "forecast_13w"
+    )
+    delta_lambda_value = (
+      _to_json_float((delta_meta or {}).get("delta_lambda"))
+      if isinstance(delta_meta, dict)
+      else None
+    )
+    if delta_lambda_value is None:
+      delta_lambda_value = 1.0
+    delta_momentum_mean_value = (
+      _to_json_float((delta_meta or {}).get("delta_momentum_mean"))
+      if isinstance(delta_meta, dict)
+      else None
+    )
+    delta_vol_scale_mean_value = (
+      _to_json_float((delta_meta or {}).get("delta_vol_scale_mean"))
+      if isinstance(delta_meta, dict)
+      else None
+    )
+    if isinstance(delta_meta, dict) and str(delta_meta.get("delta_fallback_reason") or "") == "insufficient_data":
+      fallback_delta_items: List[Dict[str, object]] = []
+      for base_item in (base_items or []):
+        fallback_item = dict(base_item)
+        fallback_meta = dict(fallback_item.get("meta") or {})
+        fallback_meta.update({
+          "delta_mode": delta_mode_value,
+          "delta_lambda": float(delta_lambda_value),
+          "delta_momentum_mean": delta_momentum_mean_value,
+          "delta_vol_scale_mean": delta_vol_scale_mean_value,
+          "delta_fallback_reason": "insufficient_data",
+          "delta_fallback_to_base": True,
+        })
+        fallback_item["meta"] = fallback_meta
+        fallback_delta_items.append(fallback_item)
+      delta_items = fallback_delta_items
     base_by_bucket = {
       str(item.get("risk_bucket")): item
       for item in (base_items or [])
@@ -3219,6 +3290,10 @@ def generate_portfolios(
         fallback_item = dict(base_by_bucket[bucket_label])
         fallback_meta = dict(fallback_item.get("meta") or {})
         fallback_meta.update({
+          "delta_mode": delta_mode_value,
+          "delta_lambda": float(delta_lambda_value),
+          "delta_momentum_mean": delta_momentum_mean_value,
+          "delta_vol_scale_mean": delta_vol_scale_mean_value,
           "delta_risk_exceeded": True,
           "delta_achieved_risk": float(risk_pct),
           "delta_fallback_to_base": True,
