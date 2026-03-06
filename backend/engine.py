@@ -1230,14 +1230,14 @@ def _build_delta_candidate_pools(
   df["risk_pct_use"] = df["risk_pct_forecast"].fillna(df["risk_pct"])
 
   # 6. 자산군별 forecast_sharpe 상위 topN개 선택 (base와 동일 구조)
-  topn_config = config.get("topN_by_class", 20)
+  topn_config = config.get("topN_by_class", 50)
   pools: Dict[str, List[Dict[str, object]]] = {}
   for asset_class in ASSET_CLASSES:
     class_df = df[df["asset_class"] == asset_class]
     if class_df.empty:
       pools[asset_class] = []
       continue
-    topn = int(topn_config) if not isinstance(topn_config, dict) else int(topn_config.get(asset_class, 20))
+    topn = int(topn_config) if not isinstance(topn_config, dict) else int(topn_config.get(asset_class, 50))
     selected = class_df.sort_values("forecast_sharpe", ascending=False).head(topn)
     pools[asset_class] = [
       {
@@ -1970,7 +1970,7 @@ def build_portfolio_qp(
 
   if mode == "delta" and returns_tail is not None:
     pools = _build_delta_candidate_pools(metrics, returns_tail, config)
-    meta["delta_pool"] = "forecast_sharpe_top20"
+    meta["delta_pool"] = "forecast_sharpe_top50"
   else:
     pools = _build_candidate_pools(metrics, config)
     meta["delta_pool"] = "sharpe_top20"
@@ -1989,15 +1989,15 @@ def build_portfolio_qp(
         continue
       holdings_rows.append(dict(row))
       used_codes.add(code)
-  if mode == "delta" and meta.get("delta_pool") == "forecast_sharpe_top20":
-    topn_cfg_meta = config.get("topN_by_class", 20)
+  if mode == "delta" and meta.get("delta_pool") == "forecast_sharpe_top50":
+    topn_cfg_meta = config.get("topN_by_class", 50)
     try:
       if isinstance(topn_cfg_meta, dict):
-        topn_delta_meta = int(topn_cfg_meta.get("default", 20))
+        topn_delta_meta = int(topn_cfg_meta.get("default", 50))
       else:
         topn_delta_meta = int(topn_cfg_meta)
     except Exception:
-      topn_delta_meta = 20
+      topn_delta_meta = 50
     meta["delta_pool_size"] = int(len(holdings_rows))
     meta["delta_topN"] = int(max(1, topn_delta_meta))
 
@@ -2237,7 +2237,7 @@ def build_portfolio_qp(
 
     delta_meta_fields = {
       "delta_mode": "pattern_repeat_13w",
-      "delta_pool": "forecast_sharpe_top20",
+      "delta_pool": "forecast_sharpe_top50",
     }
     meta.update(delta_meta_fields)
     for idx, row in enumerate(holdings_rows):
@@ -2246,7 +2246,7 @@ def build_portfolio_qp(
     mu = returns_slice_all.mean(axis=0).reindex(codes).fillna(0.0).to_numpy(dtype=float)
     delta_meta_fields = {
       "delta_mode": "pattern_repeat_13w",
-      "delta_pool": "forecast_sharpe_top20",
+      "delta_pool": "forecast_sharpe_top50",
       "delta_fallback_reason": "insufficient_data",
     }
     meta.update(delta_meta_fields)
@@ -2735,6 +2735,85 @@ def build_portfolio_qp(
       "sharpe_window": success_payload["sharpe_window"],
       "holdings": success_payload["holdings"],
       "meta": success_payload["meta"],
+    })
+
+  if mode == "delta":
+    delta_mode_value = str(meta.get("delta_mode") or "pattern_repeat_13w")
+    delta_pool_value = str(meta.get("delta_pool") or "forecast_sharpe_top50")
+    delta_candidate_count = int(len(holdings_rows))
+    delta_feasible_total = 0
+    precomputed_reason = str(meta.get("delta_fallback_reason") or "")
+    any_item_fallback = False
+
+    for item in items:
+      item_meta = dict(item.get("meta") or {})
+      item_error = str(item.get("error") or "")
+      item_holdings = item.get("holdings") if isinstance(item.get("holdings"), list) else []
+      within_bucket = bool(item_meta.get("within_bucket"))
+      feasible_in_bucket = int((not item_error) and bool(item_holdings) and within_bucket)
+      delta_feasible_total += feasible_in_bucket
+
+      fallback_to_base = bool(item_meta.get("delta_fallback_to_base"))
+      if not fallback_to_base and str(item_meta.get("delta_fallback_reason") or "") in (
+        "insufficient_data",
+        "no_delta_candidates",
+        "no_feasible_portfolio_in_bucket",
+        "risk_above_bucket_after_quantize",
+        "fallback_to_base_by_policy",
+      ):
+        fallback_to_base = True
+
+      if precomputed_reason == "insufficient_data":
+        fallback_to_base = True
+        fallback_reason = "insufficient_data"
+      elif delta_candidate_count <= 0:
+        fallback_to_base = True
+        fallback_reason = "no_delta_candidates"
+      elif fallback_to_base:
+        if bool(item_meta.get("delta_risk_exceeded")):
+          fallback_reason = "risk_above_bucket_after_quantize"
+        else:
+          fallback_reason = str(item_meta.get("delta_fallback_reason") or "fallback_to_base_by_policy")
+      elif item_error:
+        fallback_to_base = True
+        fallback_reason = "no_feasible_portfolio_in_bucket"
+      else:
+        fallback_reason = "none"
+
+      any_item_fallback = any_item_fallback or fallback_to_base
+      item_meta.update({
+        "delta_mode": delta_mode_value,
+        "delta_pool": delta_pool_value,
+        "delta_candidate_count": delta_candidate_count,
+        "delta_feasible_count": feasible_in_bucket,
+        "delta_fallback_to_base": bool(fallback_to_base),
+        "delta_fallback_reason": fallback_reason,
+      })
+      item["meta"] = item_meta
+
+    if precomputed_reason == "insufficient_data":
+      top_reason = "insufficient_data"
+      top_fallback = True
+    elif delta_candidate_count <= 0:
+      top_reason = "no_delta_candidates"
+      top_fallback = True
+    elif delta_feasible_total <= 0:
+      top_reason = "no_feasible_portfolio_in_bucket"
+      top_fallback = True
+    elif any_item_fallback:
+      top_reason = "fallback_to_base_by_policy"
+      top_fallback = True
+    else:
+      top_reason = "none"
+      top_fallback = False
+
+    meta.update({
+      "delta_mode": delta_mode_value,
+      "delta_pool": delta_pool_value,
+      "delta_candidate_count": delta_candidate_count,
+      "delta_feasible_count": int(delta_feasible_total),
+      "delta_fallback_to_base": bool(top_fallback),
+      "delta_fallback_reason": top_reason,
     })
 
   if qp_audit is not None:
@@ -3303,6 +3382,21 @@ def generate_portfolios(
       if isinstance(delta_meta, dict) and (delta_meta or {}).get("delta_mode") is not None
       else "pattern_repeat_13w"
     )
+    delta_pool_value = (
+      str((delta_meta or {}).get("delta_pool"))
+      if isinstance(delta_meta, dict) and (delta_meta or {}).get("delta_pool") is not None
+      else "forecast_sharpe_top50"
+    )
+    delta_candidate_count_value = (
+      int((delta_meta or {}).get("delta_candidate_count"))
+      if isinstance(delta_meta, dict) and (delta_meta or {}).get("delta_candidate_count") is not None
+      else 0
+    )
+    delta_feasible_count_value = (
+      int((delta_meta or {}).get("delta_feasible_count"))
+      if isinstance(delta_meta, dict) and (delta_meta or {}).get("delta_feasible_count") is not None
+      else 0
+    )
     delta_lambda_value = (
       _to_json_float((delta_meta or {}).get("delta_lambda"))
       if isinstance(delta_meta, dict)
@@ -3327,6 +3421,9 @@ def generate_portfolios(
         fallback_meta = dict(fallback_item.get("meta") or {})
         fallback_meta.update({
           "delta_mode": delta_mode_value,
+          "delta_pool": delta_pool_value,
+          "delta_candidate_count": int(delta_candidate_count_value),
+          "delta_feasible_count": int(delta_feasible_count_value),
           "delta_lambda": float(delta_lambda_value),
           "delta_momentum_mean": delta_momentum_mean_value,
           "delta_vol_scale_mean": delta_vol_scale_mean_value,
@@ -3361,12 +3458,16 @@ def generate_portfolios(
         fallback_meta = dict(fallback_item.get("meta") or {})
         fallback_meta.update({
           "delta_mode": delta_mode_value,
+          "delta_pool": delta_pool_value,
+          "delta_candidate_count": int(delta_candidate_count_value),
+          "delta_feasible_count": int(delta_feasible_count_value),
           "delta_lambda": float(delta_lambda_value),
           "delta_momentum_mean": delta_momentum_mean_value,
           "delta_vol_scale_mean": delta_vol_scale_mean_value,
           "delta_risk_exceeded": True,
           "delta_achieved_risk": float(risk_pct),
           "delta_fallback_to_base": True,
+          "delta_fallback_reason": "risk_above_bucket_after_quantize",
         })
         fallback_item["meta"] = fallback_meta
         adjusted_delta_items.append(fallback_item)
