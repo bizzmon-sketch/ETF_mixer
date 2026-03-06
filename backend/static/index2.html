@@ -1120,21 +1120,66 @@
     }
 
     function alignSeriesByDate(seriesDefs) {
-      const dateSet = new Set();
-      seriesDefs.forEach((def) => {
-        (def.points || []).forEach((p) => dateSet.add(p.date));
+      const prepared = (Array.isArray(seriesDefs) ? seriesDefs : []).map((def) => {
+        const pointMap = new Map();
+        (Array.isArray(def.points) ? def.points : [])
+          .filter((p) => p && p.date && Number.isFinite(p.value))
+          .forEach((p) => pointMap.set(p.date, p.value));
+        const dates = Array.from(pointMap.keys()).sort();
+        return { def, pointMap, dates };
       });
-      const dates = Array.from(dateSet).sort();
-      const aligned = seriesDefs.map((def) => {
-        const map = new Map((def.points || []).map((p) => [p.date, p.value]));
+
+      if (prepared.length === 0) {
+        return { dates: [], series: [] };
+      }
+
+      const nonEmpty = prepared.filter((item) => item.dates.length > 0);
+      if (nonEmpty.length === 0) {
+        return {
+          dates: [],
+          series: prepared.map(({ def }) => ({
+            name: def.name,
+            color: def.color,
+            width: def.width,
+            data: [],
+          })),
+        };
+      }
+
+      let targetDates = nonEmpty[0].dates.filter((date) =>
+        nonEmpty.every((item) => item.pointMap.has(date))
+      );
+      const hasIntersection = targetDates.length > 0;
+
+      // Fallback: 교집합이 없으면 가장 긴 시리즈의 날짜 축을 사용한다.
+      if (!hasIntersection) {
+        const longest = nonEmpty.reduce((acc, cur) =>
+          (cur.dates.length > acc.dates.length ? cur : acc)
+        );
+        targetDates = longest.dates.slice();
+      }
+
+      const aligned = prepared.map(({ def, pointMap }) => {
+        const slicedValues = targetDates.map((date) =>
+          (pointMap.has(date) ? pointMap.get(date) : null)
+        );
+        const baseline = hasIntersection
+          ? slicedValues[0]
+          : slicedValues.find((value) => Number.isFinite(value));
+        const canNormalize = Number.isFinite(baseline) && baseline !== 0;
+        const normalized = slicedValues.map((value) => {
+          if (!Number.isFinite(value)) return null;
+          return canNormalize ? (value / baseline) : value;
+        });
         return {
           name: def.name,
           color: def.color,
           width: def.width,
-          data: dates.map((d) => (map.has(d) ? map.get(d) : null)),
+          data: normalized,
         };
       });
-      return { dates, series: aligned };
+
+      return { dates: targetDates, series: aligned };
     }
 
     async function getBenchmarkSeries(weeks = 26) {

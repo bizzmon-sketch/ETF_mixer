@@ -3195,6 +3195,39 @@ def generate_portfolios(
       mode="delta",
       debug=bool(debug),
     )
+    base_by_bucket = {
+      str(item.get("risk_bucket")): item
+      for item in (base_items or [])
+      if item.get("risk_bucket") is not None
+    }
+    bucket_hi_by_label = {
+      str(bucket["label"]): _to_json_float(bucket.get("max"))
+      for bucket in _bucket_bounds()
+    }
+    adjusted_delta_items: List[Dict[str, object]] = []
+    for delta_item in (delta_items or []):
+      bucket_label = str(delta_item.get("risk_bucket") or "")
+      bucket_hi = bucket_hi_by_label.get(bucket_label)
+      risk_pct = _to_json_float(delta_item.get("risk_pct"))
+      risk_cap_105 = float(bucket_hi) * 1.05 if bucket_hi is not None else None
+      exceeded = (
+        risk_pct is not None
+        and risk_cap_105 is not None
+        and float(risk_pct) > float(risk_cap_105)
+      )
+      if exceeded and bucket_label in base_by_bucket:
+        fallback_item = dict(base_by_bucket[bucket_label])
+        fallback_meta = dict(fallback_item.get("meta") or {})
+        fallback_meta.update({
+          "delta_risk_exceeded": True,
+          "delta_achieved_risk": float(risk_pct),
+          "delta_fallback_to_base": True,
+        })
+        fallback_item["meta"] = fallback_meta
+        adjusted_delta_items.append(fallback_item)
+      else:
+        adjusted_delta_items.append(delta_item)
+    delta_items = adjusted_delta_items
     items = list(base_items)
     meta = dict(base_meta or {})
     meta["delta"] = delta_meta or {}
