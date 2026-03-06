@@ -1190,36 +1190,52 @@ def _build_delta_candidate_pools(
   returns_tail: pd.DataFrame,
   config: Dict[str, object],
 ) -> Dict[str, List[Dict[str, object]]]:
-  if returns_tail is None or returns_tail.empty or len(returns_tail.index) < 26:
+  if returns_tail is None or len(returns_tail.index) < 26:
     return _build_candidate_pools(metrics, config)
-  df = metrics.dropna(subset=["Code", "Name", "return_6m", "risk_pct", "sharpe_120d"]).copy()
+
+  df = metrics.dropna(
+    subset=["Code", "Name", "return_6m", "risk_pct", "sharpe_120d"]
+  ).copy()
   if df.empty:
     return {}
+
   df["asset_class"] = df["Name"].apply(classify_asset_class)
-  recent_13w = returns_tail.iloc[-13:]
-  prev_13w = returns_tail.iloc[-26:-13]
-  momentum = (recent_13w.mean(axis=0) - prev_13w.mean(axis=0))
-  momentum_map = {
-    str(code): float(value)
-    for code, value in momentum.items()
-    if pd.notna(value)
-  }
-  df["momentum"] = df["Code"].astype(str).map(momentum_map).fillna(0.0)
-  try:
-    topn_delta = int(config.get("topN_by_class_delta", 30))
-  except Exception:
-    topn_delta = 30
-  topn_delta = max(1, topn_delta)
+
+  codes = [c for c in df["Code"].tolist() if c in returns_tail.columns]
+  rt = returns_tail[codes]
+  recent_13w = rt.iloc[-13:]
+  prev_13w = rt.iloc[-26:-13]
+  momentum = recent_13w.mean() - prev_13w.mean()
+
+  mu_base = rt.mean()
+  cap = 0.5 * mu_base.abs()
+  contribution = momentum.clip(-cap, cap)
+  mu_forecast = mu_base + contribution
+
+  sigma_base = rt.std()
+  vol_recent = recent_13w.std()
+  vol_scale = (vol_recent / sigma_base.clip(lower=1e-8)) ** 0.5
+  vol_scale = vol_scale.clip(0.5, 2.0)
+  sigma_forecast = sigma_base * vol_scale
+
+  forecast_sharpe = mu_forecast / sigma_forecast.clip(lower=1e-8)
+
+  fs_df = forecast_sharpe.rename("forecast_sharpe").reset_index()
+  fs_df.columns = ["Code", "forecast_sharpe"]
+  df = df.merge(fs_df, on="Code", how="left")
+  df["forecast_sharpe"] = df["forecast_sharpe"].fillna(0.0)
+
+  topn_config = config.get("topN_by_class", 20)
   pools: Dict[str, List[Dict[str, object]]] = {}
   for asset_class in ASSET_CLASSES:
     class_df = df[df["asset_class"] == asset_class]
     if class_df.empty:
       pools[asset_class] = []
       continue
+    topn = int(topn_config) if not isinstance(topn_config, dict) else int(topn_config.get(asset_class, 20))
     selected = class_df.sort_values(
-      ["momentum", "sharpe_120d", "return_6m", "risk_pct", "Code"],
-      ascending=[False, False, False, True, True],
-    ).head(topn_delta)
+      "forecast_sharpe", ascending=False
+    ).head(topn)
     pools[asset_class] = [
       {
         "Code": row["Code"],
@@ -1230,7 +1246,7 @@ def _build_delta_candidate_pools(
         "sharpe_window": float(row["sharpe_120d"]),
         "mean_log_r_ann": float(row.get("mean_log_r_ann") or 0.0),
         "asset_class": asset_class,
-        "momentum": float(row.get("momentum") or 0.0),
+        "forecast_sharpe": float(row["forecast_sharpe"]),
       }
       for _, row in selected.iterrows()
     ]
@@ -1951,7 +1967,7 @@ def build_portfolio_qp(
 
   if mode == "delta" and returns_tail is not None:
     pools = _build_delta_candidate_pools(metrics, returns_tail, config)
-    meta["delta_pool"] = "momentum_top30"
+    meta["delta_pool"] = "forecast_sharpe_top20"
   else:
     pools = _build_candidate_pools(metrics, config)
     meta["delta_pool"] = "sharpe_top20"
@@ -1970,11 +1986,15 @@ def build_portfolio_qp(
         continue
       holdings_rows.append(dict(row))
       used_codes.add(code)
-  if mode == "delta" and meta.get("delta_pool") == "momentum_top30":
+  if mode == "delta" and meta.get("delta_pool") == "forecast_sharpe_top20":
+    topn_cfg_meta = config.get("topN_by_class", 20)
     try:
-      topn_delta_meta = int(config.get("topN_by_class_delta", 30))
+      if isinstance(topn_cfg_meta, dict):
+        topn_delta_meta = int(topn_cfg_meta.get("default", 20))
+      else:
+        topn_delta_meta = int(topn_cfg_meta)
     except Exception:
-      topn_delta_meta = 30
+      topn_delta_meta = 20
     meta["delta_pool_size"] = int(len(holdings_rows))
     meta["delta_topN"] = int(max(1, topn_delta_meta))
 
