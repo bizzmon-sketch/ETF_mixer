@@ -3786,6 +3786,17 @@ def _compute_trend_scores(
   if last_date not in prices.index:
     last_date = pd.Timestamp(prices.index.max())
   prices = prices.loc[:last_date]
+
+  metrics = _CACHE.get("metrics")
+  if metrics is not None and not metrics.empty:
+    cashlike_codes = set(
+      str(row["Code"])
+      for _, row in metrics.iterrows()
+      if classify_asset_class(str(row.get("Name", ""))) == "CashLike"
+    )
+  else:
+    cashlike_codes = set()
+
   daily_log = np.log(prices / prices.shift(1))
 
   windows = {
@@ -3814,6 +3825,7 @@ def _compute_trend_scores(
     sharpe = sharpe.replace([np.inf, -np.inf], np.nan)
     valid = (obs_by_code >= int(spec["min_obs"])) & std_log.gt(1e-12)
     sharpe_valid = sharpe[valid].dropna()
+    sharpe_valid = sharpe_valid[~sharpe_valid.index.isin(cashlike_codes)]
     if sharpe_valid.empty:
       continue
 
