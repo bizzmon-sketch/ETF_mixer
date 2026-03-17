@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import itertools
 import logging
 import os
 import sqlite3
@@ -1149,7 +1150,7 @@ def _estimate_feasible_min_risk_est(
 
 
 def _build_candidate_pools(metrics: pd.DataFrame, config: Dict[str, object]) -> Dict[str, List[Dict[str, object]]]:
-  df = metrics.dropna(subset=["Code", "Name", "return_6m", "risk_pct", "sharpe_120d"]).copy()
+  df = metrics.dropna(subset=["Code", "Name", "risk_pct"]).copy()
   if df.empty:
     return {}
   df["asset_class"] = df["Name"].apply(classify_asset_class)
@@ -3757,6 +3758,442 @@ def compute_custom_portfolio_rb(
   risk_pct = float(std * _WEEKLY_SCALE_TO_MONTHLY * 100.0)
   sharpe = float((float(log_returns.mean()) - _RF_WEEKLY) / std * np.sqrt(_WEEKLY_PERIODS_PER_YEAR))
   return round(return_26w, 6), round(risk_pct, 4), round(sharpe, 4), prices
+
+
+def _compute_trend_scores(
+  daily_prices: pd.DataFrame,
+  as_of_date: pd.Timestamp,
+) -> pd.Series:
+  if daily_prices is None or daily_prices.empty:
+    empty = pd.Series(dtype=float)
+    empty.attrs["obs_3m"] = 0
+    empty.attrs["obs_6m"] = 0
+    empty.attrs["obs_12m"] = 0
+    return empty
+
+  prices = daily_prices.copy()
+  prices.index = pd.to_datetime(prices.index)
+  prices = prices.sort_index()
+  prices = prices.loc[prices.index <= pd.Timestamp(as_of_date)]
+  if prices.empty:
+    empty = pd.Series(dtype=float)
+    empty.attrs["obs_3m"] = 0
+    empty.attrs["obs_6m"] = 0
+    empty.attrs["obs_12m"] = 0
+    return empty
+
+  last_date = pd.Timestamp(as_of_date)
+  if last_date not in prices.index:
+    last_date = pd.Timestamp(prices.index.max())
+  prices = prices.loc[:last_date]
+  daily_log = np.log(prices / prices.shift(1))
+
+  windows = {
+    "3m": {"months": 3, "min_obs": 47, "weight": 0.25},
+    "6m": {"months": 6, "min_obs": 95, "weight": 0.35},
+    "12m": {"months": 12, "min_obs": 189, "weight": 0.40},
+  }
+  trend_score = pd.Series(0.0, index=prices.columns, dtype=float)
+  obs_meta = {"obs_3m": 0, "obs_6m": 0, "obs_12m": 0}
+
+  for label, spec in windows.items():
+    start_target = last_date - pd.DateOffset(months=int(spec["months"]))
+    window_index = prices.index[prices.index >= start_target]
+    if len(window_index) == 0:
+      continue
+    actual_start = pd.Timestamp(window_index.min())
+    window_log = daily_log.loc[actual_start:last_date]
+    if window_log.empty:
+      continue
+
+    obs_meta[f"obs_{label}"] = int(len(window_log.index))
+    obs_by_code = window_log.count()
+    mean_log = window_log.mean()
+    std_log = window_log.std(ddof=1)
+    sharpe = (mean_log / std_log.replace(0.0, np.nan)) * np.sqrt(252.0)
+    sharpe = sharpe.replace([np.inf, -np.inf], np.nan)
+    valid = (obs_by_code >= int(spec["min_obs"])) & std_log.gt(1e-12)
+    sharpe_valid = sharpe[valid].dropna()
+    if sharpe_valid.empty:
+      continue
+
+    pct_rank = sharpe_valid.rank(method="average", pct=True, ascending=True)
+    trend_score = trend_score.add(float(spec["weight"]) * pct_rank, fill_value=0.0)
+
+  trend_score = trend_score.dropna().sort_index()
+  trend_score.attrs.update(obs_meta)
+  return trend_score
+
+
+def _prune_high_corr_with_min_keep(
+  class_df: pd.DataFrame,
+  returns_tail: pd.DataFrame,
+  corr_threshold: float = 0.85,
+  min_keep: int = 3,
+) -> pd.DataFrame:
+  if class_df.empty or returns_tail is None or returns_tail.empty:
+    return class_df
+
+  codes = [str(code) for code in class_df["Code"].tolist() if str(code) in returns_tail.columns]
+  if len(codes) < 2:
+    return class_df
+
+  class_returns = returns_tail.reindex(columns=codes).dropna(how="any")
+  if class_returns.empty:
+    return class_df
+
+  corr = class_returns.corr()
+  score_map = {
+    str(row["Code"]): float(row.get("TrendScore", 0.0))
+    for _, row in class_df.iterrows()
+  }
+  keep_codes = list(codes)
+
+  while len(keep_codes) > max(int(min_keep), 1):
+    pair_to_drop: Tuple[str, str] | None = None
+    pair_corr = None
+    for i, left in enumerate(keep_codes):
+      for right in keep_codes[i + 1:]:
+        corr_value = corr.loc[left, right] if left in corr.index and right in corr.columns else np.nan
+        if pd.isna(corr_value) or float(corr_value) <= float(corr_threshold):
+          continue
+        if pair_corr is None or float(corr_value) > float(pair_corr):
+          pair_to_drop = (left, right)
+          pair_corr = float(corr_value)
+    if pair_to_drop is None:
+      break
+
+    left, right = pair_to_drop
+    left_score = float(score_map.get(left, 0.0))
+    right_score = float(score_map.get(right, 0.0))
+    if left_score < right_score:
+      drop_code = left
+    elif right_score < left_score:
+      drop_code = right
+    else:
+      drop_code = sorted([left, right])[1]
+    keep_codes = [code for code in keep_codes if code != drop_code]
+
+  keep_set = set(keep_codes)
+  return class_df[class_df["Code"].astype(str).isin(keep_set)].copy()
+
+
+def _build_trend_candidate_rows(
+  metrics: pd.DataFrame,
+  returns_tail: pd.DataFrame,
+  trend_scores: pd.Series,
+  config: Dict[str, object],
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+  df = metrics.dropna(subset=["Code", "Name", "return_6m", "risk_pct", "sharpe_120d"]).copy()
+  if df.empty:
+    return [], {"candidate_count": 0, "candidate_by_class": {}}
+
+  df["Code"] = df["Code"].astype(str)
+  df["asset_class"] = df["Name"].apply(classify_asset_class)
+  trend_df = trend_scores.rename("TrendScore").reset_index()
+  if not trend_df.empty:
+    trend_df.columns = ["Code", "TrendScore"]
+    trend_df["Code"] = trend_df["Code"].astype(str)
+    df = df.merge(trend_df, on="Code", how="left")
+  else:
+    df["TrendScore"] = 0.0
+  df["TrendScore"] = df["TrendScore"].fillna(0.0)
+
+  topn_config = config.get("topN_by_class", 20)
+  candidate_rows: List[Dict[str, object]] = []
+  candidate_by_class: Dict[str, int] = {}
+
+  for asset_class in ASSET_CLASSES:
+    class_df = df[df["asset_class"] == asset_class].copy()
+    if class_df.empty:
+      candidate_by_class[asset_class] = 0
+      continue
+    class_df = class_df.sort_values(
+      ["TrendScore", "sharpe_120d", "return_6m", "risk_pct", "Code"],
+      ascending=[False, False, False, True, True],
+    )
+    class_df = _prune_high_corr_with_min_keep(class_df, returns_tail, corr_threshold=0.85, min_keep=3)
+    class_df = class_df.sort_values(
+      ["TrendScore", "sharpe_120d", "return_6m", "risk_pct", "Code"],
+      ascending=[False, False, False, True, True],
+    )
+    if isinstance(topn_config, dict):
+      topn = int(topn_config.get(asset_class, topn_config.get("default", 20)))
+    else:
+      topn = int(topn_config)
+    selected = class_df.head(max(topn, 1))
+    candidate_by_class[asset_class] = int(len(selected))
+    for _, row in selected.iterrows():
+      candidate_rows.append({
+        "Code": str(row["Code"]),
+        "Name": str(row["Name"]),
+        "return_52w": float(row.get("return_52w") or row["return_6m"]),
+        "return_6m": float(row["return_6m"]),
+        "risk_pct": float(row["risk_pct"]),
+        "sharpe_window": float(row["sharpe_120d"]),
+        "mean_log_r_ann": float(row.get("mean_log_r_ann") or 0.0),
+        "asset_class": asset_class,
+        "TrendScore": float(row["TrendScore"]),
+        "qp_score": float(row["TrendScore"]),
+      })
+
+  candidate_rows = sorted(
+    candidate_rows,
+    key=lambda row: (
+      -float(row.get("TrendScore", 0.0)),
+      -float(row.get("sharpe_window", 0.0)),
+      str(row.get("Code")),
+    ),
+  )
+  return candidate_rows, {
+    "candidate_count": int(len(candidate_rows)),
+    "candidate_by_class": candidate_by_class,
+  }
+
+
+def _trend_combo_search_rows(candidate_rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+  by_class: Dict[str, List[Dict[str, object]]] = {asset_class: [] for asset_class in ASSET_CLASSES}
+  for row in candidate_rows:
+    by_class.setdefault(str(row.get("asset_class", "Equity")), []).append(row)
+
+  search_rows: List[Dict[str, object]] = []
+  used_codes: set[str] = set()
+  for asset_class in ASSET_CLASSES:
+    for row in by_class.get(asset_class, [])[:4]:
+      code = str(row["Code"])
+      if code in used_codes:
+        continue
+      search_rows.append(row)
+      used_codes.add(code)
+  return search_rows
+
+
+def _trend_is_feasible_combo(combo_rows: List[Dict[str, object]]) -> bool:
+  if len(combo_rows) != 5:
+    return False
+  class_counts: Dict[str, int] = {}
+  code_set: set[str] = set()
+  for row in combo_rows:
+    code = str(row["Code"])
+    asset_class = str(row["asset_class"])
+    if code in code_set:
+      return False
+    code_set.add(code)
+    class_counts[asset_class] = class_counts.get(asset_class, 0) + 1
+    if class_counts[asset_class] > 2:
+      return False
+  return True
+
+
+def _trend_weight_pct_map(rows: List[Dict[str, object]], weights: np.ndarray) -> Dict[str, int]:
+  return {
+    str(row["Code"]): int(round(float(weight) * 100.0))
+    for row, weight in zip(rows, weights)
+    if float(weight) > 1e-12
+  }
+
+
+def build_portfolio_trend(
+  metrics: pd.DataFrame,
+  returns_tail: pd.DataFrame,
+  config: Dict[str, object],
+) -> Dict[str, object]:
+  if metrics is None or returns_tail is None:
+    return {"error": "no_data"}
+  if not isinstance(metrics, pd.DataFrame) or not isinstance(returns_tail, pd.DataFrame):
+    return {"error": "no_data"}
+  if metrics.empty or returns_tail.empty:
+    return {"error": "no_data"}
+  try:
+    import cvxpy  # noqa: F401
+  except Exception:
+    return {"error": "solver_unavailable"}
+
+  codes_series = metrics.get("Code")
+  if codes_series is None:
+    return {"error": "no_data"}
+  all_codes = [
+    str(code) for code in codes_series.dropna().astype(str).tolist()
+    if str(code).strip()
+  ]
+  if not all_codes:
+    return {"error": "no_data"}
+
+  as_of_value = _CACHE.get("data_asof") or pd.Timestamp.today().normalize()
+  as_of_date = pd.Timestamp(as_of_value)
+  start = as_of_date - pd.DateOffset(months=13)
+  daily_close = load_close_prices(all_codes, start, as_of_date)
+  trend_scores = _compute_trend_scores(daily_close, as_of_date)
+  candidate_rows, candidate_meta = _build_trend_candidate_rows(metrics, returns_tail, trend_scores, config)
+  if len(candidate_rows) < 5:
+    return {
+      "error": "insufficient_candidates",
+      "meta": {
+        "trend_score_weights": {"3m": 0.25, "6m": 0.35, "12m": 0.40},
+        "corr_threshold": 0.85,
+        "risk_range": [2.0, 7.0],
+        "candidate_count": int(candidate_meta.get("candidate_count", 0)),
+        "gamma_used": None,
+        "as_of_date": as_of_date.strftime("%Y-%m-%d"),
+        "obs_3m": int(trend_scores.attrs.get("obs_3m", 0)),
+        "obs_6m": int(trend_scores.attrs.get("obs_6m", 0)),
+        "obs_12m": int(trend_scores.attrs.get("obs_12m", 0)),
+      },
+    }
+
+  search_rows = _trend_combo_search_rows(candidate_rows)
+  if len(search_rows) < 5:
+    return {"error": "insufficient_candidates"}
+
+  combos: List[List[Dict[str, object]]] = []
+  for combo_idx in itertools.combinations(range(len(search_rows)), 5):
+    combo_rows = [search_rows[idx] for idx in combo_idx]
+    if not _trend_is_feasible_combo(combo_rows):
+      continue
+    combos.append(combo_rows)
+  combos = sorted(
+    combos,
+    key=lambda rows: (
+      -sum(float(row.get("TrendScore", 0.0)) for row in rows),
+      "".join(str(row["Code"]) for row in rows),
+    ),
+  )[:300]
+  if not combos:
+    return {"error": "insufficient_candidates"}
+
+  gamma_trials = [2.0, 4.0, 8.0]
+  solver_order = ["ECOS", "OSQP", "SCS"]
+  scale_to_monthly = float(np.sqrt(52.0 / 12.0))
+  best_solution: Dict[str, object] | None = None
+
+  for gamma in gamma_trials:
+    for combo_rows in combos:
+      combo_codes = [str(row["Code"]) for row in combo_rows]
+      returns_slice, _ = _align_returns_intersection(returns_tail, combo_codes)
+      if returns_slice.empty:
+        continue
+      if len(returns_slice.index) < 10:
+        continue
+      mu_raw = np.array([float(row.get("TrendScore", 0.0)) for row in combo_rows], dtype=float)
+      mu = mu_raw - mu_raw.mean()
+      sigma_df = returns_slice.reindex(columns=combo_codes).cov()
+      sigma = sigma_df.to_numpy(dtype=float)
+      sigma = (sigma + sigma.T) / 2.0
+      if sigma.shape != (5, 5) or not np.isfinite(sigma).all():
+        continue
+
+      weights = None
+      for solver_name in solver_order:
+        weights, solve_diag = _qp_solve_weights(
+          mu,
+          sigma,
+          gamma,
+          lower_bounds=np.full(5, 0.05, dtype=float),
+          upper_bounds=np.full(5, 0.40, dtype=float),
+          solver=solver_name,
+        )
+        if weights is not None:
+          break
+        if str(solve_diag.get("fail_reason")) == "no_solver":
+          continue
+      if weights is None:
+        continue
+
+      weights = _normalize_weights(weights)
+      w_q = _quantize_5pct(weights, np.full(5, 0.40, dtype=float), step=0.05)
+      if w_q is None:
+        continue
+      w_final, repair_diag = _swap_repair_band(
+        w_q,
+        sigma,
+        np.full(5, 0.40, dtype=float),
+        lo_pct=2.0,
+        hi_pct=7.0,
+        scale_to_monthly=scale_to_monthly,
+        max_steps=400,
+      )
+      final_risk = _portfolio_risk_pct(w_final, sigma, scale_to_monthly=scale_to_monthly)
+      if final_risk is None or final_risk < 2.0 or final_risk > 7.0:
+        continue
+
+      class_counts: Dict[str, int] = {}
+      for row in combo_rows:
+        asset_class = str(row["asset_class"])
+        class_counts[asset_class] = class_counts.get(asset_class, 0) + 1
+      if any(count > 2 for count in class_counts.values()):
+        continue
+
+      objective_value = float(mu @ w_final - gamma * float(w_final @ sigma @ w_final))
+      weight_pct_map = _trend_weight_pct_map(combo_rows, w_final)
+      return_52w, sharpe_52w, _ = _compute_portfolio_52w_metrics(combo_rows, weight_pct_map, returns_tail)
+      holdings = sorted(
+        [
+          {
+            "Code": str(row["Code"]),
+            "Name": str(row["Name"]),
+            "weight": float(round(weight_pct_map[str(row["Code"])], 2)),
+            "asset_class": str(row["asset_class"]),
+          }
+          for row in combo_rows
+          if str(row["Code"]) in weight_pct_map
+        ],
+        key=lambda item: (-float(item["weight"]), str(item["Code"])),
+      )
+      solution = {
+        "strategy": "trend",
+        "holdings": holdings,
+        "return_52w": None if return_52w is None else round(float(return_52w), 6),
+        "risk_pct": round(float(final_risk), 4),
+        "sharpe": None if sharpe_52w is None else round(float(sharpe_52w), 4),
+        "meta": {
+          "trend_score_weights": {"3m": 0.25, "6m": 0.35, "12m": 0.40},
+          "corr_threshold": 0.85,
+          "risk_range": [2.0, 7.0],
+          "candidate_count": int(candidate_meta.get("candidate_count", 0)),
+          "gamma_used": float(gamma),
+          "as_of_date": as_of_date.strftime("%Y-%m-%d"),
+          "obs_3m": int(trend_scores.attrs.get("obs_3m", 0)),
+          "obs_6m": int(trend_scores.attrs.get("obs_6m", 0)),
+          "obs_12m": int(trend_scores.attrs.get("obs_12m", 0)),
+          "repair_steps": int(repair_diag.get("repair_steps", 0)),
+          "candidate_by_class": candidate_meta.get("candidate_by_class", {}),
+        },
+      }
+      if best_solution is None or objective_value > float(best_solution["_objective"]):
+        solution["_objective"] = objective_value
+        best_solution = solution
+
+    if best_solution is not None:
+      break
+
+  if best_solution is None:
+    return {
+      "error": "no_feasible_portfolio",
+      "meta": {
+        "trend_score_weights": {"3m": 0.25, "6m": 0.35, "12m": 0.40},
+        "corr_threshold": 0.85,
+        "risk_range": [2.0, 7.0],
+        "candidate_count": int(candidate_meta.get("candidate_count", 0)),
+        "gamma_used": None,
+        "as_of_date": as_of_date.strftime("%Y-%m-%d"),
+        "obs_3m": int(trend_scores.attrs.get("obs_3m", 0)),
+        "obs_6m": int(trend_scores.attrs.get("obs_6m", 0)),
+        "obs_12m": int(trend_scores.attrs.get("obs_12m", 0)),
+      },
+    }
+
+  best_solution.pop("_objective", None)
+  return best_solution
+
+
+def get_trend_portfolio() -> Dict[str, object]:
+  if _CACHE.get("metrics") is None:
+    _refresh_cache_from_db()
+  return build_portfolio_trend(
+    _CACHE["metrics"],
+    _CACHE["returns_tail"],
+    CONFIG,
+  )
 
 
 if __name__ == "__main__":
