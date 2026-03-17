@@ -3843,6 +3843,8 @@ def _prune_high_corr_with_min_keep(
     return class_df
 
   corr = class_returns.corr()
+  corr_np = corr.values
+  code_idx = {code: i for i, code in enumerate(corr.columns)}
   score_map = {
     str(row["Code"]): float(row.get("TrendScore", 0.0))
     for _, row in class_df.iterrows()
@@ -3853,8 +3855,14 @@ def _prune_high_corr_with_min_keep(
     pair_to_drop: Tuple[str, str] | None = None
     pair_corr = None
     for i, left in enumerate(keep_codes):
+      left_idx = code_idx.get(left)
+      if left_idx is None:
+        continue
       for right in keep_codes[i + 1:]:
-        corr_value = corr.loc[left, right] if left in corr.index and right in corr.columns else np.nan
+        right_idx = code_idx.get(right)
+        if right_idx is None:
+          continue
+        corr_value = corr_np[left_idx, right_idx]
         if pd.isna(corr_value) or float(corr_value) <= float(corr_threshold):
           continue
         if pair_corr is None or float(corr_value) > float(pair_corr):
@@ -3908,20 +3916,21 @@ def _build_trend_candidate_rows(
     if class_df.empty:
       candidate_by_class[asset_class] = 0
       continue
-    class_df = class_df.sort_values(
-      ["TrendScore", "sharpe_120d", "return_6m", "risk_pct", "Code"],
-      ascending=[False, False, False, True, True],
-    )
-    class_df = _prune_high_corr_with_min_keep(class_df, returns_tail, corr_threshold=0.85, min_keep=3)
-    class_df = class_df.sort_values(
-      ["TrendScore", "sharpe_120d", "return_6m", "risk_pct", "Code"],
-      ascending=[False, False, False, True, True],
-    )
     if isinstance(topn_config, dict):
       topn = int(topn_config.get(asset_class, topn_config.get("default", 20)))
     else:
       topn = int(topn_config)
-    selected = class_df.head(max(topn, 1))
+    class_df = class_df.sort_values(
+      ["TrendScore", "sharpe_120d", "return_6m", "risk_pct", "Code"],
+      ascending=[False, False, False, True, True],
+    )
+    pre_select = class_df.head(min(max(topn, 1) * 3, len(class_df))).copy()
+    pre_select = _prune_high_corr_with_min_keep(pre_select, returns_tail, corr_threshold=0.85, min_keep=3)
+    pre_select = pre_select.sort_values(
+      ["TrendScore", "sharpe_120d", "return_6m", "risk_pct", "Code"],
+      ascending=[False, False, False, True, True],
+    )
+    selected = pre_select.head(max(topn, 1))
     candidate_by_class[asset_class] = int(len(selected))
     for _, row in selected.iterrows():
       candidate_rows.append({
