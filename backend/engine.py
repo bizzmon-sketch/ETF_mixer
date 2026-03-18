@@ -4014,271 +4014,200 @@ def _trend_weight_pct_map(rows: List[Dict[str, object]], weights: np.ndarray) ->
   }
 
 
+def _max_sharpe_analytical(
+  mu: np.ndarray,
+  sigma: np.ndarray,
+  w_min: float = 0.05,
+  w_max: float = 0.40,
+) -> np.ndarray | None:
+  sig = (sigma + sigma.T) / 2.0
+  sig = sig + 1e-8 * np.eye(len(sig))
+
+  try:
+    cond = np.linalg.cond(sig)
+    if cond > 1e8:
+      return None
+  except Exception:
+    return None
+
+  try:
+    sig_inv_mu = np.linalg.solve(sig, mu)
+  except np.linalg.LinAlgError:
+    return None
+
+  total = float(np.sum(sig_inv_mu))
+  if abs(total) < 1e-12:
+    return None
+
+  w = sig_inv_mu / total
+
+  for _ in range(3):
+    w = np.clip(w, w_min, w_max)
+    s = float(w.sum())
+    if s < 1e-12:
+      return None
+    w = w / s
+
+  w = np.where(w < w_min, 0.0, w)
+  s = float(w.sum())
+  if s < 1e-12:
+    return None
+  w = w / s
+
+  return w
+
+
 def build_portfolio_trend(
   metrics: pd.DataFrame,
   returns_tail: pd.DataFrame,
   config: Dict[str, object],
 ) -> Dict[str, object]:
-  trend_weights = {"12m": 0.40, "6m": 0.35, "3m": 0.25}
-  gamma = 4.0
-  risk_range = [2.0, 7.0]
-  solver_order = ["ECOS", "OSQP", "SCS"]
-  scale_to_monthly = float(_WEEKLY_SCALE_TO_MONTHLY)
-
   if metrics is None or returns_tail is None:
     return {"error": "no_data"}
-  if not isinstance(metrics, pd.DataFrame) or not isinstance(returns_tail, pd.DataFrame):
-    return {"error": "no_data"}
-  if metrics.empty or returns_tail.empty:
-    return {"error": "no_data"}
-  if len(returns_tail.index) < 13:
+  if not isinstance(returns_tail, pd.DataFrame) or len(returns_tail) < 13:
     return {"error": "insufficient_data"}
-  try:
-    import cvxpy
-  except Exception:
-    return {"error": "solver_unavailable"}
 
-  pools = _build_candidate_pools(metrics, config)
+  trend_config = dict(config)
+  trend_config["topN_by_class"] = 10
+  pools = _build_candidate_pools(metrics, trend_config)
+
   holdings_rows: List[Dict[str, object]] = []
   used_codes: set[str] = set()
   for asset_class in ASSET_CLASSES:
     for row in pools.get(asset_class, []):
-      code = row["Code"]
-      if code in used_codes:
-        continue
-      holdings_rows.append(dict(row))
-      used_codes.add(code)
-  if not holdings_rows:
+      if row["Code"] not in used_codes:
+        holdings_rows.append(dict(row))
+        used_codes.add(row["Code"])
+
+  if len(holdings_rows) < 5:
     return {"error": "insufficient_candidates"}
 
-  codes = [str(row["Code"]) for row in holdings_rows]
-  returns_slice_all, alignment_meta = _align_returns_intersection(returns_tail, codes)
-  if returns_slice_all.empty:
-    return {
-      "error": "missing_covariance",
-      "meta": {
-        "trend_weights": trend_weights,
-        "gamma": gamma,
-        "risk_range": risk_range,
-        **alignment_meta,
-      },
-    }
-  if len(returns_slice_all.index) < 13:
-    return {
-      "error": "insufficient_data",
-      "meta": {
-        "trend_weights": trend_weights,
-        "gamma": gamma,
-        "risk_range": risk_range,
-        **alignment_meta,
-      },
-    }
+  codes_available = [h["Code"] for h in holdings_rows if h["Code"] in returns_tail.columns]
+  returns_slice, _ = _align_returns_intersection(returns_tail, codes_available)
+  if returns_slice.empty or len(returns_slice) < 13:
+    return {"error": "insufficient_data"}
 
-  mu_12m = returns_slice_all.iloc[-52:].mean().reindex(codes).fillna(0.0)
-  mu_6m = returns_slice_all.iloc[-26:].mean().reindex(codes).fillna(0.0)
-  mu_3m = returns_slice_all.iloc[-13:].mean().reindex(codes).fillna(0.0)
-  mu_series = (0.40 * mu_12m) + (0.35 * mu_6m) + (0.25 * mu_3m)
-  mu = mu_series.to_numpy(dtype=float)
-  for idx, row in enumerate(holdings_rows):
-    row["qp_score"] = float(mu[idx])
+  holdings_rows = [h for h in holdings_rows if h["Code"] in returns_slice.columns]
+  if len(holdings_rows) < 5:
+    return {"error": "insufficient_candidates"}
 
-  sigma = returns_slice_all.cov().values
-  sigma = (sigma + sigma.T) / 2
-  if not np.isfinite(sigma).all():
-    return {
-      "error": "nan_inf",
-      "meta": {
-        "trend_weights": trend_weights,
-        "gamma": gamma,
-        "risk_range": risk_range,
-        **alignment_meta,
-      },
-    }
+  mu_52w = returns_slice.mean()
+  mu_26w = returns_slice.iloc[-26:].mean() if len(returns_slice) >= 26 else returns_slice.mean()
+  mu_13w = returns_slice.iloc[-13:].mean()
+  mu_trend = 0.40 * mu_52w + 0.35 * mu_26w + 0.25 * mu_13w
 
-  upper_bounds = np.full(len(holdings_rows), 0.4, dtype=float)
-  max_holdings = 5
-  feasible_min_risk_est = _estimate_feasible_min_risk_est(
-    holdings_rows,
-    [],
-    min_weight=0.10,
-    max_holdings=max_holdings,
+  top_codes = [h["Code"] for h in holdings_rows]
+  sigma_full = returns_slice[top_codes].cov().values
+  sigma_full = (sigma_full + sigma_full.T) / 2.0
+  sigma_full += 1e-8 * np.eye(len(sigma_full))
+
+  mu_arr_full = np.array(
+    [float(mu_trend.get(c, 0.0)) for c in top_codes],
+    dtype=float,
   )
 
-  fallback_attempts = [
-    {"level": 0, "min_weight": 0.10, "max_holdings": max_holdings},
-    {"level": 1, "min_weight": 0.05, "max_holdings": max_holdings},
-  ]
-  best_solver_diag = None
-  last_attempt_error = "postprocess_zero"
+  scale_to_monthly = float(np.sqrt(52.0 / 12.0))
+  best_trend_sharpe = -np.inf
+  best_result = None
 
-  for attempt in fallback_attempts:
-    min_weight_attempt = float(attempt["min_weight"])
-    max_holdings_attempt = int(attempt["max_holdings"])
+  for combo_idx in itertools.combinations(range(len(holdings_rows)), 5):
+    combo_rows = [holdings_rows[i] for i in combo_idx]
 
-    weights = None
-    solve_diag = None
-    for solver_name in solver_order:
-      weights, solve_diag = _qp_solve_weights(
-        mu,
-        sigma,
-        gamma,
-        lower_bounds=np.full(len(holdings_rows), min_weight_attempt, dtype=float)
-        if len(holdings_rows) <= int(round(1.0 / min_weight_attempt))
-        else None,
-        upper_bounds=upper_bounds,
-        solver=solver_name,
-        risk_cap_pct=float(risk_range[1]),
-        scale_to_monthly=scale_to_monthly,
-      )
-      if weights is not None:
-        break
-    best_solver_diag = solve_diag
-    if weights is None:
-      last_attempt_error = str((solve_diag or {}).get("fail_reason") or "solver_failed")
+    class_count: Dict[str, int] = {}
+    for row in combo_rows:
+      ac = row["asset_class"]
+      class_count[ac] = class_count.get(ac, 0) + 1
+    if any(v > 2 for v in class_count.values()):
       continue
 
-    best_weights = _normalize_weights(weights)
-    selected_indices, _ = _select_qp_holdings_topk(
-      holdings_rows,
-      best_weights,
-      [],
-      max_holdings=max_holdings_attempt,
-      min_weight=min_weight_attempt,
+    combo_codes = [r["Code"] for r in combo_rows]
+    idx5 = [top_codes.index(c) for c in combo_codes]
+    mu5 = mu_arr_full[idx5]
+    sigma5 = sigma_full[np.ix_(idx5, idx5)]
+
+    w = _max_sharpe_analytical(mu5, sigma5, w_min=0.05, w_max=0.40)
+    if w is None:
+      continue
+
+    w_q = _quantize_5pct(
+      w,
+      np.full(5, 0.40, dtype=float),
+      step=0.05,
     )
-    if len(selected_indices) != max_holdings:
-      last_attempt_error = "insufficient_candidates"
-      continue
-
-    selected_rows = [holdings_rows[idx] for idx in selected_indices]
-    selected_codes = [str(row["Code"]) for row in selected_rows]
-    upper_selected = np.full(len(selected_rows), 0.4, dtype=float)
-    sel_sigma_idx = [codes.index(code) for code in selected_codes]
-    sel_sigma = sigma[np.ix_(sel_sigma_idx, sel_sigma_idx)]
-
-    cont_w_sel = _normalize_weights(best_weights[selected_indices])
-    w_q = _quantize_5pct(cont_w_sel, upper_selected, step=0.05)
     if w_q is None:
-      lower_bounds = np.full(len(selected_rows), min_weight_attempt, dtype=float)
-      w_q = _project_weights_with_bounds(cont_w_sel, lower_bounds, upper_selected)
-      if w_q is None:
-        last_attempt_error = "postprocess_infeasible"
-        continue
+      continue
 
-    w_final, repair_diag = _swap_repair_band(
+    w_final, _ = _swap_repair_band(
       w_q,
-      sel_sigma,
-      upper_selected,
-      lo_pct=float(risk_range[0]),
-      hi_pct=float(risk_range[1]),
+      sigma5,
+      np.full(5, 0.40, dtype=float),
+      lo_pct=2.0,
+      hi_pct=7.0,
       scale_to_monthly=scale_to_monthly,
-      max_steps=400,
+      max_steps=200,
     )
-    if len(selected_rows) != 5:
-      last_attempt_error = "insufficient_candidates"
-      continue
 
-    best_weight_by_code = {codes[i]: float(best_weights[i]) for i in range(len(codes))}
-    post_processed = _soft_select_after_quantize(
-      holdings_rows,
-      selected_rows,
+    risk = _portfolio_risk_pct(
       w_final,
-      best_weight_by_code,
-      min_weight=min_weight_attempt,
-      primary_count=5,
-      fallback_count=5,
-    )
-    if post_processed is None:
-      last_attempt_error = "postprocess_zero"
-      continue
-
-    final_rows_out, final_weights, fixed_count, class_swap_count = post_processed
-    if fixed_count != 5 or len(final_rows_out) != 5:
-      last_attempt_error = "postprocess_zero"
-      continue
-
-    class_counts: Dict[str, int] = {}
-    for row in final_rows_out:
-      asset_class = str(row.get("asset_class"))
-      class_counts[asset_class] = class_counts.get(asset_class, 0) + 1
-    if any(count > 2 for count in class_counts.values()):
-      last_attempt_error = "class_limit_exceeded"
-      continue
-
-    pos_sigma_idx = [codes.index(str(row["Code"])) for row in final_rows_out]
-    pos_sigma = sigma[np.ix_(pos_sigma_idx, pos_sigma_idx)]
-    final_risk = _portfolio_risk_pct(
-      final_weights,
-      pos_sigma,
+      sigma5,
       scale_to_monthly=scale_to_monthly,
     )
-    if final_risk is None or final_risk < float(risk_range[0]) or final_risk > float(risk_range[1]):
-      last_attempt_error = "risk_out_of_range"
+    if risk is None or risk < 2.0 or risk > 7.0:
       continue
 
-    final_sharpe = _compute_portfolio_sharpe_from_returns(
-      returns_slice_all,
-      [str(row["Code"]) for row in final_rows_out],
-      final_weights,
-      periods_per_year=_WEEKLY_PERIODS_PER_YEAR,
-    )
-    weights_pct = _format_weight_percentages(final_weights, decimals=2)
-    holdings_output = sorted(
-      [
-        {
-          "Code": row["Code"],
-          "Name": row["Name"],
-          "weight": float(weight_pct),
-          "asset_class": row["asset_class"],
-        }
-        for row, weight_pct in zip(final_rows_out, weights_pct)
-        if float(weight_pct) > 0
-      ],
-      key=lambda holding: (-holding["weight"], holding["Code"]),
-    )
-    if len(holdings_output) != 5:
-      last_attempt_error = "postprocess_zero"
+    port_var = float(w_final @ sigma5 @ w_final)
+    if port_var < 1e-12:
       continue
+    trend_sharpe = float(mu5 @ w_final) / float(port_var ** 0.5)
 
-    weights_for_52w = {
-      str(row["Code"]): float(weight) * 100.0
-      for row, weight in zip(final_rows_out, final_weights)
-    }
-    return_52w, sharpe_52w, _ = _compute_portfolio_52w_metrics(
-      final_rows_out,
-      weights_for_52w,
-      returns_tail,
-    )
-    adequacy_meta = _portfolio_adequacy_meta(final_rows_out, final_weights, final_risk)
+    if trend_sharpe > best_trend_sharpe:
+      best_trend_sharpe = trend_sharpe
+      weight_map = {
+        combo_codes[i]: float(round(w_final[i] * 100, 2))
+        for i in range(5)
+      }
+      best_result = {
+        "combo_rows": combo_rows,
+        "w_final": w_final,
+        "weight_map": weight_map,
+        "risk_pct": risk,
+        "trend_sharpe": trend_sharpe,
+      }
 
-    return {
-      "strategy": "trend",
-      "holdings": holdings_output,
-      "return_52w": None if return_52w is None else round(float(return_52w), 6),
-      "risk_pct": round(float(final_risk), 4),
-      "sharpe": None if sharpe_52w is None else round(float(sharpe_52w), 4),
-      "meta": {
-        "trend_weights": trend_weights,
-        "gamma": gamma,
-        "risk_range": risk_range,
-        "repair_steps": int(repair_diag.get("repair_steps", 0)),
-        "fixed_holdings_count": int(fixed_count),
-        "class_soft_swaps": int(class_swap_count),
-        "feasible_min_risk_est": feasible_min_risk_est,
-        "sharpe_window": None if final_sharpe is None else float(final_sharpe),
-        **adequacy_meta,
-        **alignment_meta,
-      },
-    }
+  if best_result is None:
+    return {"error": "no_feasible_portfolio"}
+
+  return_52w, sharpe_52w, _ = _compute_portfolio_52w_metrics(
+    best_result["combo_rows"],
+    best_result["weight_map"],
+    returns_tail,
+  )
+
+  holdings = sorted(
+    [
+      {
+        "Code": r["Code"],
+        "Name": r["Name"],
+        "weight": float(best_result["weight_map"].get(r["Code"], 0.0)),
+        "asset_class": r["asset_class"],
+      }
+      for r in best_result["combo_rows"]
+      if best_result["weight_map"].get(r["Code"], 0.0) > 0
+    ],
+    key=lambda x: (-x["weight"], x["Code"]),
+  )
 
   return {
-    "error": str(last_attempt_error or "no_feasible_portfolio"),
+    "strategy": "trend",
+    "holdings": holdings,
+    "return_52w": None if return_52w is None else round(float(return_52w), 6),
+    "risk_pct": round(float(best_result["risk_pct"]), 4),
+    "sharpe": None if sharpe_52w is None else round(float(sharpe_52w), 4),
+    "trend_sharpe": round(float(best_result["trend_sharpe"]), 4),
     "meta": {
-      "trend_weights": trend_weights,
-      "gamma": gamma,
-      "risk_range": risk_range,
-      "feasible_min_risk_est": feasible_min_risk_est,
-      "solver_diag": best_solver_diag,
-      **alignment_meta,
+      "trend_weights": {"12m": 0.40, "6m": 0.35, "3m": 0.25},
+      "risk_range": [2.0, 7.0],
+      "candidate_count": len(holdings_rows),
     },
   }
 
