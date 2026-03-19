@@ -4020,6 +4020,8 @@ def _max_sharpe_analytical(
   w_min: float = 0.05,
   w_max: float = 0.40,
 ) -> np.ndarray | None:
+  # unconstrained analytical seed (Sigma^-1 @ mu) + box clipping heuristic
+  # exact constrained max Sharpe optimum is NOT guaranteed
   sig = (sigma + sigma.T) / 2.0
   sig = sig + 1e-8 * np.eye(len(sig))
 
@@ -4271,13 +4273,20 @@ def build_portfolio_buckets(
   config: Dict[str, object],
   mode: str = "base",
 ) -> object:
+  bucket_labels = ["0-3%", "3-6%", "6-9%"]
   if metrics is None or returns_tail is None:
-    return {"error": "no_data", "base": [], "delta": []}
-  if not isinstance(returns_tail, pd.DataFrame) or len(returns_tail) < 13:
-    return {"error": "insufficient_data", "base": [], "delta": []}
+    return [
+      {"strategy": "bucket", "risk_bucket": label, "error": "no_data"}
+      for label in bucket_labels
+    ]
+  if not isinstance(returns_tail, pd.DataFrame) or len(returns_tail) < 52:
+    return [
+      {"strategy": "bucket", "risk_bucket": label, "error": "insufficient_data"}
+      for label in bucket_labels
+    ]
 
   bucket_config = dict(config)
-  bucket_config["topN_by_class"] = 10
+  bucket_config["topN_by_class"] = 7
   pools = _build_candidate_pools(metrics, bucket_config)
 
   metrics_codes = set(metrics["Code"].astype(str).tolist())
@@ -4412,6 +4421,11 @@ def build_portfolio_buckets(
         scale_to_monthly=scale_to_monthly,
       )
       if risk is None or risk < bucket_lo or risk > bucket_hi:
+        continue
+
+      # 5종목 hard rule 검증
+      active_count = int(np.sum(w_final >= 0.04999))
+      if active_count != 5:
         continue
 
       port_var = float(w_final @ sigma5 @ w_final)
