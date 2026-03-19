@@ -4265,6 +4265,235 @@ def get_trend_portfolio() -> Dict[str, object]:
   )
 
 
+def build_portfolio_buckets(
+  metrics: pd.DataFrame,
+  returns_tail: pd.DataFrame,
+  config: Dict[str, object],
+  mode: str = "base",
+) -> object:
+  if metrics is None or returns_tail is None:
+    return {"error": "no_data", "base": [], "delta": []}
+  if not isinstance(returns_tail, pd.DataFrame) or len(returns_tail) < 13:
+    return {"error": "insufficient_data", "base": [], "delta": []}
+
+  bucket_config = dict(config)
+  bucket_config["topN_by_class"] = 10
+  pools = _build_candidate_pools(metrics, bucket_config)
+
+  metrics_codes = set(metrics["Code"].astype(str).tolist())
+
+  all_codes: List[str] = []
+  seen_codes: set[str] = set()
+  for asset_class in ASSET_CLASSES:
+    for row in pools.get(asset_class, []):
+      code = str(row["Code"])
+      if code in metrics_codes and code not in seen_codes:
+        all_codes.append(code)
+        seen_codes.add(code)
+
+  codes_in_rt = [code for code in all_codes if code in returns_tail.columns]
+  returns_slice, _ = _align_returns_intersection(returns_tail, codes_in_rt)
+  if returns_slice.empty or len(returns_slice) < 13:
+    return {"error": "insufficient_data", "items": []}
+
+  if mode == "delta" and len(returns_slice) >= 26:
+    mu_52w = returns_slice.mean()
+    mu_26w = returns_slice.iloc[-26:].mean()
+    mu_13w = returns_slice.iloc[-13:].mean()
+    mu_map = (0.40 * mu_52w + 0.35 * mu_26w + 0.25 * mu_13w).to_dict()
+  else:
+    mu_map: Dict[str, float] = {}
+    for asset_class in ASSET_CLASSES:
+      for row in pools.get(asset_class, []):
+        code = str(row["Code"])
+        if code in metrics_codes:
+          mu_map[code] = float(row.get("mean_log_r_ann") or 0.0)
+
+  top_codes = [code for code in codes_in_rt if code in returns_slice.columns]
+  if len(top_codes) < 5:
+    return {"error": "insufficient_data", "items": []}
+
+  sigma_full = returns_slice[top_codes].cov().values
+  sigma_full = (sigma_full + sigma_full.T) / 2.0
+  sigma_full += 1e-8 * np.eye(len(sigma_full))
+  mu_arr_full = np.array([float(mu_map.get(code, 0.0)) for code in top_codes], dtype=float)
+  top_code_index = {code: idx for idx, code in enumerate(top_codes)}
+
+  buckets = [
+    {"label": "0-3%", "lo": 0.0, "hi": 3.0, "cashlike_max": 2},
+    {"label": "3-6%", "lo": 3.0, "hi": 6.0, "cashlike_max": 1},
+    {"label": "6-9%", "lo": 6.0, "hi": 9.0, "cashlike_max": 0},
+  ]
+
+  scale_to_monthly = float(np.sqrt(52.0 / 12.0))
+  results = []
+
+  for bucket in buckets:
+    bucket_lo = float(bucket["lo"])
+    bucket_hi = float(bucket["hi"])
+    cashlike_max = int(bucket["cashlike_max"])
+
+    bucket_rows: List[Dict[str, object]] = []
+    used_codes = set()
+    for asset_class in ASSET_CLASSES:
+      for row in pools.get(asset_class, []):
+        code = str(row["Code"])
+        if code not in metrics_codes:
+          continue
+        if code not in returns_slice.columns:
+          continue
+        if asset_class == "CashLike" and cashlike_max == 0:
+          continue
+        if code not in used_codes:
+          bucket_rows.append(dict(row))
+          used_codes.add(code)
+
+    if len(bucket_rows) < 5:
+      results.append({
+        "strategy": "bucket",
+        "risk_bucket": bucket["label"],
+        "error": "no_feasible_portfolio",
+        "meta": {"reason": "insufficient_candidates"},
+      })
+      continue
+
+    best_sharpe = -np.inf
+    best_result = None
+
+    for combo_idx in itertools.combinations(range(len(bucket_rows)), 5):
+      combo_rows = [bucket_rows[i] for i in combo_idx]
+
+      class_count: Dict[str, int] = {}
+      for row in combo_rows:
+        asset_class = str(row["asset_class"])
+        class_count[asset_class] = class_count.get(asset_class, 0) + 1
+      if any(count > 2 for count in class_count.values()):
+        continue
+
+      cashlike_count = sum(
+        1 for row in combo_rows if str(row["asset_class"]) == "CashLike"
+      )
+      if cashlike_count > cashlike_max:
+        continue
+
+      combo_codes = [str(row["Code"]) for row in combo_rows]
+      idx5 = [top_code_index[code] for code in combo_codes if code in top_code_index]
+      if len(idx5) != 5:
+        continue
+
+      mu5 = mu_arr_full[idx5]
+      sigma5 = sigma_full[np.ix_(idx5, idx5)]
+
+      w = _max_sharpe_analytical(mu5, sigma5, w_min=0.05, w_max=0.40)
+      if w is None:
+        continue
+
+      w_q = _quantize_5pct(
+        w,
+        np.full(5, 0.40, dtype=float),
+        step=0.05,
+      )
+      if w_q is None:
+        continue
+
+      w_final, _ = _swap_repair_band(
+        w_q,
+        sigma5,
+        np.full(5, 0.40, dtype=float),
+        lo_pct=bucket_lo,
+        hi_pct=bucket_hi,
+        scale_to_monthly=scale_to_monthly,
+        max_steps=200,
+      )
+
+      risk = _portfolio_risk_pct(
+        w_final,
+        sigma5,
+        scale_to_monthly=scale_to_monthly,
+      )
+      if risk is None or risk < bucket_lo or risk > bucket_hi:
+        continue
+
+      port_var = float(w_final @ sigma5 @ w_final)
+      if port_var < 1e-12:
+        continue
+      port_sharpe = float(mu5 @ w_final) / float(port_var ** 0.5)
+
+      if port_sharpe > best_sharpe:
+        best_sharpe = port_sharpe
+        weight_map = {
+          combo_codes[i]: float(round(w_final[i] * 100, 2))
+          for i in range(5)
+        }
+        best_result = {
+          "combo_rows": combo_rows,
+          "weight_map": weight_map,
+          "risk_pct": risk,
+          "port_sharpe": port_sharpe,
+        }
+
+    if best_result is None:
+      results.append({
+        "strategy": "bucket",
+        "risk_bucket": bucket["label"],
+        "error": "no_feasible_portfolio",
+        "meta": {
+          "reason": "no_combination_in_range",
+          "bucket_lo": bucket_lo,
+          "bucket_hi": bucket_hi,
+        },
+      })
+      continue
+
+    return_52w, sharpe_52w, _ = _compute_portfolio_52w_metrics(
+      best_result["combo_rows"],
+      best_result["weight_map"],
+      returns_tail,
+    )
+
+    holdings = sorted(
+      [
+        {
+          "Code": row["Code"],
+          "Name": row["Name"],
+          "weight": float(best_result["weight_map"].get(row["Code"], 0.0)),
+          "asset_class": row["asset_class"],
+        }
+        for row in best_result["combo_rows"]
+        if best_result["weight_map"].get(row["Code"], 0.0) > 0
+      ],
+      key=lambda item: (-item["weight"], item["Code"]),
+    )
+
+    results.append({
+      "strategy": "bucket",
+      "risk_bucket": bucket["label"],
+      "holdings": holdings,
+      "return_52w": None if return_52w is None else round(float(return_52w), 6),
+      "risk_pct": round(float(best_result["risk_pct"]), 4),
+      "sharpe": None if sharpe_52w is None else round(float(sharpe_52w), 4),
+      "meta": {
+        "mode": mode,
+        "bucket_lo": bucket_lo,
+        "bucket_hi": bucket_hi,
+        "cashlike_max": cashlike_max,
+        "candidate_count": len(bucket_rows),
+      },
+    })
+
+  return results
+
+
+def get_bucket_portfolios() -> Dict[str, object]:
+  if _CACHE.get("metrics") is None:
+    _refresh_cache_from_db()
+  metrics = _CACHE["metrics"]
+  returns_tail = _CACHE["returns_tail"]
+  base = build_portfolio_buckets(metrics, returns_tail, CONFIG, mode="base")
+  delta = build_portfolio_buckets(metrics, returns_tail, CONFIG, mode="delta")
+  return {"base": base, "delta": delta}
+
+
 if __name__ == "__main__":
   _refresh_cache_from_db()
   print("scatter rows:", len(get_scatter_data()))
