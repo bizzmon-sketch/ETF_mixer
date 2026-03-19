@@ -342,6 +342,7 @@
       api: {
         scatter: '/api/scatter',
         portfolios: '/api/portfolios?strategy=qp',
+        bucket: '/api/bucket_portfolios',
         trend: '/api/trend_portfolio',
         prices: '/api/prices',
         benchmarkPrices: '/api/benchmark_prices',
@@ -372,6 +373,8 @@
       portfolios: [],
       portfoliosBase: [],
       portfoliosDelta: [],
+      portfoliosBucketBase: [],
+      portfoliosBucketDelta: [],
       portfolioTrend: null,
       portfolioMode: 'base',
       selectedCode: null,
@@ -555,12 +558,58 @@
       updateBucketTabActive();
     }
 
+    function getRefPanelItems() {
+      return state.portfolioMode === 'delta'
+        ? state.portfoliosBucketDelta
+        : state.portfoliosBucketBase;
+    }
+
+    function renderRefPanel() {
+      const container = document.getElementById('bucketTabs');
+      if (!container) return;
+      container.innerHTML = '';
+
+      const items = Array.isArray(getRefPanelItems()) ? getRefPanelItems() : [];
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'small text-muted px-1 py-2';
+        empty.textContent = '참고 포트폴리오 데이터가 없습니다.';
+        container.appendChild(empty);
+        return;
+      }
+
+      for (const item of items) {
+        const hasPortfolio = item && item.error !== 'no_feasible_portfolio';
+        const el = document.createElement(hasPortfolio ? 'button' : 'div');
+        el.className = 'bucket-btn';
+
+        if (hasPortfolio) {
+          const bucket = item.risk_bucket || '';
+          el.type = 'button';
+          el.setAttribute('data-jump', bucket);
+          el.textContent = bucket;
+          el.addEventListener('click', () => {
+            setSelectedPortfolio(bucket);
+          });
+        } else {
+          el.setAttribute('aria-disabled', 'true');
+          el.style.opacity = '0.7';
+          el.style.cursor = 'default';
+          el.textContent = `${item.risk_bucket || '해당 구간'}: 이번 주 해당 구간 적합 포트 없음`;
+        }
+
+        container.appendChild(el);
+      }
+
+      updateBucketTabActive();
+    }
+
     function renderModeTabs() {
       const container = document.getElementById('modeTabs');
       if (!container) return;
       container.innerHTML = '';
       [
-        { mode: 'base', label: 'base' },
+        { mode: 'base', label: '기본형' },
         { mode: 'delta', label: 'delta' },
       ].forEach((item) => {
         const btn = document.createElement('button');
@@ -581,7 +630,7 @@
         state.selectedPortfolioBucket = null;
       }
       renderModeTabs();
-      renderRecommendCards();
+      renderRefPanel();
       renderTrendPortfolioCard(state.portfolioTrend);
       renderPlot();
       if (state.selectedPortfolioBucket) {
@@ -1438,12 +1487,26 @@
 
       renderTrendPortfolioCard(null);
       renderModeTabs();
-      renderRecommendCards();
+      renderRefPanel();
       renderCustomBuilder();
       renderSidebar(null);
       renderPlot();
       resetHoverInfo();
       updatePricePanel(null);
+
+      fetchJson(CONFIG.api.bucket)
+        .then((bucket) => {
+          const filterBuckets = (items) => (Array.isArray(items) ? items : [])
+            .filter((item) => item && typeof item === 'object');
+          state.portfoliosBucketBase = filterBuckets(bucket.base || []);
+          state.portfoliosBucketDelta = filterBuckets(bucket.delta || []);
+          renderRefPanel();
+        })
+        .catch(() => {
+          state.portfoliosBucketBase = [];
+          state.portfoliosBucketDelta = [];
+          renderRefPanel();
+        });
 
       fetchJson(CONFIG.api.trend)
         .then((trend) => {
