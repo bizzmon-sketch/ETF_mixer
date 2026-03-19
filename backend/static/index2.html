@@ -118,6 +118,7 @@
       border: 1px solid rgba(0,0,0,0.12);
     }
     .search-msg { font-size: 12px; color: var(--muted); }
+    .cursor-pointer { cursor: pointer; }
     .price-panel {
       border-top: 1px solid rgba(0,0,0,0.06);
       margin-top: 16px;
@@ -169,8 +170,23 @@
             <span class="tag tag-demo">DEMO</span>
           </div>
           <div class="card-body">
-            <div class="bucket-tabs mb-2" id="modeTabs"></div>
-            <div class="bucket-tabs" id="bucketTabs"></div>
+            <div id="trendPortfolioCard" class="mb-3"></div>
+
+            <div class="mb-2">
+              <button class="btn btn-sm btn-outline-secondary w-100 text-start"
+                      type="button"
+                      data-bs-toggle="collapse"
+                      data-bs-target="#refPortfolioPanel"
+                      aria-expanded="false">
+                 기본형 구간별 참고 보기
+              </button>
+              <div class="collapse" id="refPortfolioPanel">
+                <div class="mt-2">
+                  <div class="bucket-tabs mb-2" id="modeTabs"></div>
+                  <div class="bucket-tabs" id="bucketTabs"></div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -326,6 +342,7 @@
       api: {
         scatter: '/api/scatter',
         portfolios: '/api/portfolios?strategy=qp',
+        trend: '/api/trend_portfolio',
         prices: '/api/prices',
         benchmarkPrices: '/api/benchmark_prices',
         customPortfolioEval: '/api/custom_portfolio_eval',
@@ -355,6 +372,7 @@
       portfolios: [],
       portfoliosBase: [],
       portfoliosDelta: [],
+      portfolioTrend: null,
       portfolioMode: 'base',
       selectedCode: null,
       selectedPortfolioBucket: null,
@@ -409,6 +427,8 @@
       state.selectedCode = null;
       state.selectedPortfolioBucket = null;
       renderSidebar(null);
+      renderTrendPortfolioCard(state.portfolioTrend);
+      updateBucketTabActive();
       renderPlot();
       updatePricePanel(null);
     }
@@ -428,6 +448,81 @@
       if (item && item.return_52w !== undefined && item.return_52w !== null) return '52주 수익률';
       if (item && item.return_120d !== undefined && item.return_120d !== null) return '120일 수익률';
       return '52주 수익률';
+    }
+
+    function getTrendPortfolioLike() {
+      const trend = state.portfolioTrend;
+      if (!trend || trend.error) return null;
+      return {
+        risk_bucket: '추세반영',
+        holdings: Array.isArray(trend.holdings) ? trend.holdings : [],
+        return_52w: trend.return_52w,
+        risk_pct: trend.risk_pct,
+        sharpe_52w: trend.sharpe,
+        sharpe_52w_ann: trend.sharpe,
+      };
+    }
+
+    function findPortfolioByBucket(bucket) {
+      if (bucket === '추세반영') {
+        return getTrendPortfolioLike();
+      }
+      return state.portfolios.find((item) => item.risk_bucket === bucket) || null;
+    }
+
+    function renderTrendPortfolioCard(trend) {
+      const container = document.getElementById('trendPortfolioCard');
+      if (!container) return;
+
+      if (trend === null || trend === undefined) {
+        container.innerHTML = `
+          <div class="card mb-2">
+            <div class="card-body p-2">
+              <div class="fw-bold mb-1">추세반영 포트폴리오</div>
+              <div class="small text-muted"> 계산 중...</div>
+            </div>
+          </div>
+        `;
+        return;
+      }
+      if (trend.error) {
+        container.innerHTML = `
+          <div class="card mb-2">
+            <div class="card-body p-2">
+              <div class="fw-bold mb-1">추세반영 포트폴리오</div>
+              <div class="small text-muted text-danger">현재 추세 포트를 생성하지 못했습니다</div>
+            </div>
+          </div>
+        `;
+        return;
+      }
+
+      const holdings = Array.isArray(trend.holdings) ? trend.holdings : [];
+      const rows = holdings.map((holding) => `
+        <tr>
+          <td>${escapeHtml(holding.Name || '-')}</td>
+          <td class="text-muted">${escapeHtml(holding.asset_class || '-')}</td>
+          <td class="text-end">${Number(holding.weight || 0).toFixed(1)}%</td>
+        </tr>
+      `).join('');
+      const activeClass = state.selectedPortfolioBucket === '추세반영' ? ' border border-2 border-primary' : '';
+      container.innerHTML = `
+        <div class="card mb-2 cursor-pointer${activeClass}" id="trendPortfolioCardInner">
+          <div class="card-body p-2">
+            <div class="fw-bold mb-1">추세반영 포트폴리오</div>
+            <div class="small text-muted mb-2">
+              수익률 ${fmtPctFromRatioSafe(trend.return_52w, 1)}&nbsp;&nbsp;변동성 ${fmtPct(trend.risk_pct, 2)}&nbsp;&nbsp;샤프 ${trend.sharpe === null || trend.sharpe === undefined || Number.isNaN(Number(trend.sharpe)) ? '-' : Number(trend.sharpe).toFixed(2)}
+            </div>
+            <table class="table table-sm mb-0">
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>
+      `;
+      const card = document.getElementById('trendPortfolioCardInner');
+      if (card) {
+        card.addEventListener('click', selectTrendPortfolio);
+      }
     }
 
     function renderRecommendCards() {
@@ -487,9 +582,10 @@
       }
       renderModeTabs();
       renderRecommendCards();
+      renderTrendPortfolioCard(state.portfolioTrend);
       renderPlot();
       if (state.selectedPortfolioBucket) {
-        const selected = state.portfolios.find((item) => item.risk_bucket === state.selectedPortfolioBucket);
+        const selected = findPortfolioByBucket(state.selectedPortfolioBucket);
         renderSidebar(selected || null);
       }
     }
@@ -623,7 +719,9 @@
       const isPortfolio = Array.isArray(item.holdings);
       if (isPortfolio) {
         document.getElementById('portfolioTitle').textContent = `${item.risk_bucket || '리스크 미분류'} 포트폴리오`;
-        document.getElementById('portfolioSubtitle').textContent = '리스크 구간별 혼합 포트폴리오';
+        document.getElementById('portfolioSubtitle').textContent = item.risk_bucket === '추세반영'
+          ? '추세반영 단일 포트폴리오'
+          : '리스크 구간별 혼합 포트폴리오';
       } else {
         document.getElementById('portfolioTitle').textContent = item.Name;
         document.getElementById('portfolioSubtitle').textContent = item.Code;
@@ -642,7 +740,8 @@
       document.getElementById('metricReturn').textContent = fmtPctFromRatioSafe(getReturnRatio(item), 1);
       document.getElementById('metricVol').textContent = fmtPct(item.risk_pct, 2);
       const sharpeVal = (item.sharpe_52w_ann !== undefined && item.sharpe_52w_ann !== null)
-        ? item.sharpe_52w_ann : item.sharpe_120d;
+        ? item.sharpe_52w_ann
+        : ((item.sharpe_120d !== undefined && item.sharpe_120d !== null) ? item.sharpe_120d : item.sharpe_52w);
       if (sharpeVal !== undefined && sharpeVal !== null && !Number.isNaN(Number(sharpeVal))) {
         document.getElementById('metricSharpe').textContent = Number(sharpeVal).toFixed(2);
       } else {
@@ -690,7 +789,9 @@
         list.appendChild(row);
       }
 
-      document.getElementById('explainText').textContent = `${item.risk_bucket || '리스크 구간'} 기준 제약 조건을 만족하는 혼합 포트폴리오입니다.`;
+      document.getElementById('explainText').textContent = item.risk_bucket === '추세반영'
+        ? '최근 추세를 반영한 단일 포트폴리오입니다.'
+        : `${item.risk_bucket || '리스크 구간'} 기준 제약 조건을 만족하는 혼합 포트폴리오입니다.`;
     }
 
     function buildPlotTraces() {
@@ -723,6 +824,21 @@
         meta: { type: 'portfolio', bucket: item.risk_bucket },
       }));
 
+      const trend = getTrendPortfolioLike();
+      const trendData = trend && Number.isFinite(Number(trend.risk_pct)) && Number.isFinite(Number(getReturnRatio(trend)))
+        ? [{
+          value: [trend.risk_pct, getReturnRatio(trend) * 100],
+          name: '추세반영',
+          symbolSize: isMobile ? 20 : 16,
+          itemStyle: {
+            color: '#7c3aed',
+            borderColor: '#5b21b6',
+            borderWidth: isMobile ? 3 : 2,
+          },
+          meta: { type: 'portfolio', bucket: '추세반영' },
+        }]
+        : [];
+
       const series = [
         {
           name: 'ETF',
@@ -745,6 +861,21 @@
             formatter: '{b}',
           },
           clip: false,
+        },
+        {
+          name: '추세반영 포트폴리오',
+          type: 'scatter',
+          symbol: 'diamond',
+          data: trendData,
+          label: {
+            show: trendData.length > 0,
+            position: 'top',
+            color: '#7c3aed',
+            fontSize: isMobile ? 14 : 12,
+            formatter: '{b}',
+          },
+          clip: false,
+          z: 4,
         },
       ];
 
@@ -771,7 +902,7 @@
       let overlayLineData = [];
       let overlayPointData = [];
       if (state.selectedPortfolioBucket) {
-        const portfolio = state.portfolios.find((x) => x.risk_bucket === state.selectedPortfolioBucket);
+        const portfolio = findPortfolioByBucket(state.selectedPortfolioBucket);
         if (portfolio && Array.isArray(portfolio.holdings)) {
           const holdingPoints = portfolio.holdings
             .map((holding) => {
@@ -1068,7 +1199,7 @@
     function renderHoverInfo(meta) {
       const el = document.getElementById('hoverInfo');
       if (meta.type === 'portfolio') {
-        const portfolio = state.portfolios.find((item) => item.risk_bucket === meta.bucket);
+        const portfolio = findPortfolioByBucket(meta.bucket);
         if (!portfolio) return;
         const holdings = Array.isArray(portfolio.holdings) ? portfolio.holdings : [];
         const holdingText = holdings.slice(0, 4).map((h) => `${h.Name}(${h.weight}%)`).join(', ');
@@ -1299,11 +1430,13 @@
         .filter((item) => item && typeof item === 'object');
       state.portfoliosBase = filterBuckets(portfolios.base || portfolios.items);
       state.portfoliosDelta = filterBuckets(portfolios.delta || []);
+      state.portfolioTrend = null;
       state.portfolioMode = 'base';
       state.portfolios = state.portfoliosBase;
       state.selectedCode = null;
       state.selectedPortfolioBucket = null;
 
+      renderTrendPortfolioCard(null);
       renderModeTabs();
       renderRecommendCards();
       renderCustomBuilder();
@@ -1311,6 +1444,17 @@
       renderPlot();
       resetHoverInfo();
       updatePricePanel(null);
+
+      fetchJson(CONFIG.api.trend)
+        .then((trend) => {
+          state.portfolioTrend = trend;
+          renderTrendPortfolioCard(trend);
+          renderPlot();
+        })
+        .catch(() => {
+          state.portfolioTrend = { error: 'trend_unavailable' };
+          renderTrendPortfolioCard(state.portfolioTrend);
+        });
     }
 
     function wireUI() {
@@ -1358,8 +1502,10 @@
       return 'Equity';
     }
 
-    function setSelectedPortfolio(bucket) {
-      const found = state.portfolios.find((item) => item.risk_bucket === bucket);
+    function setSelectedPortfolio(bucketOrPortfolio) {
+      const found = typeof bucketOrPortfolio === 'string'
+        ? findPortfolioByBucket(bucketOrPortfolio)
+        : bucketOrPortfolio;
       if (!found) return;
       if (window.__chart) {
         window.__chart.dispatchAction({ type: 'downplay', seriesIndex: 0 });
@@ -1369,9 +1515,28 @@
       state.selectedPortfolioBucket = found.risk_bucket;
       state.selectedCode = null;
       renderSidebar(found);
+      renderTrendPortfolioCard(state.portfolioTrend);
       updateBucketTabActive();
       renderPlot();
       loadPortfolioComparisonSeries(found);
+    }
+
+    function selectTrendPortfolio() {
+      const trend = state.portfolioTrend;
+      if (!trend || trend.error) return;
+      const portfolioLike = {
+        strategy: 'trend',
+        risk_bucket: '추세반영',
+        label: '추세반영 포트폴리오',
+        holdings: trend.holdings || [],
+        return_52w: trend.return_52w,
+        risk_pct: trend.risk_pct,
+        sharpe_52w: trend.sharpe,
+        sharpe_52w_ann: trend.sharpe,
+        meta: trend.meta || {},
+      };
+      setSelectedPortfolio(portfolioLike);
+      loadPortfolioComparisonSeries(portfolioLike);
     }
 
     function getEtfScatterIndex(code) {
@@ -1411,6 +1576,7 @@
       state.selectedCode = found.Code;
       state.selectedPortfolioBucket = null;
       clearPortfolioOverlay();
+      renderTrendPortfolioCard(state.portfolioTrend);
       renderPlot();
       renderSidebar(found);
       updateBucketTabActive();
