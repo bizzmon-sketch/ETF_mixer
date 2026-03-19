@@ -4094,7 +4094,37 @@ def build_portfolio_trend(
   mu_52w = returns_slice.mean()
   mu_26w = returns_slice.iloc[-26:].mean() if len(returns_slice) >= 26 else returns_slice.mean()
   mu_13w = returns_slice.iloc[-13:].mean()
-  mu_trend = 0.40 * mu_52w + 0.35 * mu_26w + 0.25 * mu_13w
+
+  # CashLike 기준값 계산 (후보풀 중 CashLike 종목들의 평균)
+  cashlike_codes = [
+    h["Code"] for h in holdings_rows
+    if h.get("asset_class") == "CashLike"
+    and h["Code"] in returns_slice.columns
+  ]
+  if cashlike_codes:
+    cash_52w = float(returns_slice[cashlike_codes].mean(axis=1).mean())
+    cash_26w = float(returns_slice[cashlike_codes].iloc[-26:].mean(axis=1).mean()) if len(returns_slice) >= 26 else cash_52w
+    cash_13w = float(returns_slice[cashlike_codes].iloc[-13:].mean(axis=1).mean())
+  else:
+    cash_52w = 0.0
+    cash_26w = 0.0
+    cash_13w = 0.0
+
+  # excess mu: CashLike 대비 초과수익률
+  mu_excess_52w = mu_52w - cash_52w
+  mu_excess_26w = mu_26w - cash_26w
+  mu_excess_13w = mu_13w - cash_13w
+  mu_trend = (0.40 * mu_excess_52w
+              + 0.35 * mu_excess_26w
+              + 0.25 * mu_excess_13w)
+
+  # meta에 cash 기준값 기록
+  cash_ref = {
+    "cash_mu_52w": round(float(cash_52w * 52), 6),
+    "cash_mu_26w": round(float(cash_26w * 52), 6),
+    "cash_mu_13w": round(float(cash_13w * 52), 6),
+    "cashlike_count": len(cashlike_codes),
+  }
 
   top_codes = [h["Code"] for h in holdings_rows]
   sigma_full = returns_slice[top_codes].cov().values
@@ -4208,6 +4238,7 @@ def build_portfolio_trend(
       "trend_weights": {"12m": 0.40, "6m": 0.35, "3m": 0.25},
       "risk_range": [2.0, 7.0],
       "candidate_count": len(holdings_rows),
+      "cash_ref": cash_ref,
     },
   }
 
