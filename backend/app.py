@@ -463,6 +463,20 @@ def trend_portfolio():
   return jsonify(payload)
 
 
+@app.get("/api/bucket_portfolios")
+def bucket_portfolios():
+  cache_path = os.path.join(CACHE_DIR, "portfolios_bucket.json")
+  cached = _read_json_cache(cache_path)
+  if cached is not None:
+    return jsonify(_attach_metadata(cached, "cache"))
+
+  payload = engine.get_bucket_portfolios()
+  payload = _attach_metadata(payload, "runtime")
+  if isinstance(payload, dict) and "error" not in payload:
+    _write_json_atomic(cache_path, payload)
+  return jsonify(payload)
+
+
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=5000, debug=True)
 
