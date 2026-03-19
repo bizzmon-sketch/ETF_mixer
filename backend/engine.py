@@ -4071,9 +4071,14 @@ def build_portfolio_trend(
   trend_config["topN_by_class"] = 10
   pools = _build_candidate_pools(metrics, trend_config)
 
+  # CashLike는 excess mu 기준용으로만 분리, 후보에서 제외
+  cashlike_ref_rows = pools.get("CashLike", [])
+
   holdings_rows: List[Dict[str, object]] = []
   used_codes: set[str] = set()
   for asset_class in ASSET_CLASSES:
+    if asset_class == "CashLike":
+      continue
     for row in pools.get(asset_class, []):
       if row["Code"] not in used_codes:
         holdings_rows.append(dict(row))
@@ -4095,11 +4100,10 @@ def build_portfolio_trend(
   mu_26w = returns_slice.iloc[-26:].mean() if len(returns_slice) >= 26 else returns_slice.mean()
   mu_13w = returns_slice.iloc[-13:].mean()
 
-  # CashLike 기준값 계산 (후보풀 중 CashLike 종목들의 평균)
+  # cashlike_ref_rows에서 코드 추출 (pools['CashLike'] 기반)
   cashlike_codes = [
-    h["Code"] for h in holdings_rows
-    if h.get("asset_class") == "CashLike"
-    and h["Code"] in returns_slice.columns
+    r["Code"] for r in cashlike_ref_rows
+    if r["Code"] in returns_slice.columns
   ]
   if cashlike_codes:
     cash_52w = float(returns_slice[cashlike_codes].mean(axis=1).mean())
@@ -4125,6 +4129,14 @@ def build_portfolio_trend(
     "cash_mu_13w": round(float(cash_13w * 52), 6),
     "cashlike_count": len(cashlike_codes),
   }
+
+  # excess mu가 0 이하인 종목 제외 (CashLike보다 못한 종목)
+  holdings_rows = [
+    h for h in holdings_rows
+    if float(mu_trend.get(h["Code"], 0.0)) > 0.0
+  ]
+  if len(holdings_rows) < 5:
+    return {"error": "insufficient_candidates"}
 
   top_codes = [h["Code"] for h in holdings_rows]
   sigma_full = returns_slice[top_codes].cov().values
