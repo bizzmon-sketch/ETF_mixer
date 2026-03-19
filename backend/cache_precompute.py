@@ -66,6 +66,20 @@ def main() -> None:
   portfolios_path = os.path.join(CACHE_DIR, f"portfolios_{strategy}_{score}.json")
   _write_json_atomic(portfolios_path, portfolios_payload)
 
+  qp_payload = _attach_metadata(
+      _build_portfolios("qp", "sharpe"), "precompute")
+  qp_path = os.path.join(CACHE_DIR, "portfolios_qp_sharpe.json")
+  _write_json_atomic(qp_path, qp_payload)
+
+  try:
+    trend_payload = engine.get_trend_portfolio()
+    trend_payload = _attach_metadata(trend_payload, "precompute")
+    if "error" not in trend_payload:
+      trend_path = os.path.join(CACHE_DIR, "portfolios_trend.json")
+      _write_json_atomic(trend_path, trend_payload)
+  except Exception as e:
+    print(f"[cache_precompute] trend portfolio 캐시 실패: {e}")
+
 
 if __name__ == "__main__":
   main()
